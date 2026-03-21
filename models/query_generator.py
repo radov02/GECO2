@@ -6,7 +6,7 @@ from torch import nn
 
 from models.regression_head import UpsamplingLayer
 from models.transformer import SelfCrossAttentionBlock, PrototypeAttentionBlock
-from models.ops.modules.ms_deform_attn import MSDeformAttn
+from modules.ms_deform_attn import MSDeformAttn
 
 class C_base(nn.Module):
     def __init__(
