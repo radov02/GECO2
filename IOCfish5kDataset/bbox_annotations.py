@@ -103,6 +103,8 @@ def _ensure_center_inside(bx, by, bw, bh, cx, cy, h, w):
 def build_sam2_predictor(device: str = "cuda"):
     """Build and return a SAM2ImagePredictor (downloads weights on first run)."""
     import torch
+    from hydra import initialize_config_dir
+    from hydra.core.global_hydra import GlobalHydra
     from sam2.build_sam import build_sam2_hf
     from sam2.sam2_image_predictor import SAM2ImagePredictor
 
@@ -110,7 +112,10 @@ def build_sam2_predictor(device: str = "cuda"):
         print("CUDA not available – falling back to CPU (will be slow).")
         device = "cpu"
 
-    model = build_sam2_hf(SAM2_HF_MODEL_ID, device=device)
+    sam2_configs_dir = str(SAM2_ROOT / "sam2" / "sam2_configs")
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(config_dir=sam2_configs_dir, version_base="1.2"):
+        model = build_sam2_hf(SAM2_HF_MODEL_ID, device=device)
     return SAM2ImagePredictor(model)
 
 
