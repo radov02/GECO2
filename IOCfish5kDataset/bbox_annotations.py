@@ -18,7 +18,9 @@ import cv2
 import numpy as np
 
 # ── SAM 2 path setup (deferred import) ─────────────────────────────────────────
-SAM2_ROOT = Path(__file__).resolve().parent.parent / "GECO2" / "sam2"
+# Add the GECO2 root (parent of the sam2 repo dir) so that `import sam2`
+# resolves to sam2/ and `sam2.sam2` resolves to sam2/sam2/ (the package).
+SAM2_ROOT = Path(__file__).resolve().parent.parent
 if str(SAM2_ROOT) not in sys.path:
     sys.path.insert(0, str(SAM2_ROOT))
 
