@@ -100,3 +100,11 @@ cache/
 *.pdb
 *.mat
 *.h5
+
+# ======================
+# IOCfish5k Dataset
+# ======================
+IOCfish5kDataset/annotations/**
+IOCfish5kDataset/images/**
+!IOCfish5kDataset/annotations/.gitkeep
+!IOCfish5kDataset/images/.gitkeep
