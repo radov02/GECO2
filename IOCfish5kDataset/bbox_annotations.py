@@ -29,6 +29,7 @@ BASE_DIR = Path(__file__).parent
 IMG_DIR  = BASE_DIR / "images"
 ANN_DIR  = BASE_DIR / "annotations"
 OUT_DIR  = IMG_DIR  / "bbox_annotated"
+XML_DIR  = OUT_DIR  / "xml"
 
 # ── visual settings ────────────────────────────────────────────────────────────
 DOT_RADIUS     = 4
@@ -265,23 +266,99 @@ def compute_bboxes_watershed(
     return bboxes
 
 
-# ── drawing + I/O ──────────────────────────────────────────────────────────────
+# ── XML export ─────────────────────────────────────────────────────────────────
 
-def process_image(
-    img_path: Path,
+def write_bbox_xml(
     xml_path: Path,
-    out_path: Path,
+    img_path: Path,
+    img_shape: tuple[int, int, int],
+    points: list[tuple[int, int]],
+    bboxes: list[tuple[int, int, int, int]],
+) -> None:
+    """Write bbox + centre annotations in Pascal-VOC-style XML."""
+    h, w, d = img_shape
+
+    root = ET.Element("annotation")
+    ET.SubElement(root, "folder").text = img_path.parent.name
+    ET.SubElement(root, "filename").text = img_path.name
+    ET.SubElement(root, "path").text = str(img_path)
+
+    source = ET.SubElement(root, "source")
+    ET.SubElement(source, "database").text = "Unknown"
+
+    size = ET.SubElement(root, "size")
+    ET.SubElement(size, "width").text = str(w)
+    ET.SubElement(size, "height").text = str(h)
+    ET.SubElement(size, "depth").text = str(d)
+
+    ET.SubElement(root, "segmented").text = "0"
+
+    for (cx, cy), (bx, by, bw, bh) in zip(points, bboxes):
+        obj = ET.SubElement(root, "object")
+        ET.SubElement(obj, "name").text = "fish"
+        ET.SubElement(obj, "pose").text = "Unspecified"
+        ET.SubElement(obj, "truncated").text = "0"
+        ET.SubElement(obj, "difficult").text = "0"
+
+        pt = ET.SubElement(obj, "point")
+        ET.SubElement(pt, "x").text = str(cx)
+        ET.SubElement(pt, "y").text = str(cy)
+
+        bndbox = ET.SubElement(obj, "bndbox")
+        ET.SubElement(bndbox, "xmin").text = str(bx)
+        ET.SubElement(bndbox, "ymin").text = str(by)
+        ET.SubElement(bndbox, "xmax").text = str(bx + bw)
+        ET.SubElement(bndbox, "ymax").text = str(by + bh)
+
+    tree = ET.ElementTree(root)
+    ET.indent(tree, space="  ")
+    xml_path.parent.mkdir(parents=True, exist_ok=True)
+    tree.write(xml_path, encoding="unicode", xml_declaration=True)
+
+
+# ── XML parsing (bbox annotations) ─────────────────────────────────────────────
+
+def parse_bbox_xml(
+    xml_path: Path,
+) -> list[tuple[tuple[int, int], tuple[int, int, int, int]]]:
+    """Parse a bbox-annotated XML and return [(center, bbox), ...].
+
+    Each entry is ((cx, cy), (xmin, ymin, xmax, ymax)).
+    """
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    results = []
+    for obj in root.findall("object"):
+        pt = obj.find("point")
+        bb = obj.find("bndbox")
+        if pt is None or bb is None:
+            continue
+        cx = int(pt.findtext("x", "0"))
+        cy = int(pt.findtext("y", "0"))
+        xmin = int(bb.findtext("xmin", "0"))
+        ymin = int(bb.findtext("ymin", "0"))
+        xmax = int(bb.findtext("xmax", "0"))
+        ymax = int(bb.findtext("ymax", "0"))
+        results.append(((cx, cy), (xmin, ymin, xmax, ymax)))
+    return results
+
+
+# ── Phase 1: compute bboxes → write XML ────────────────────────────────────────
+
+def generate_bbox_xml(
+    img_path: Path,
+    ann_xml_path: Path,
     predictor=None,
 ) -> int:
-    """Estimate bboxes, draw them with centre dots, and save the result.
+    """Compute bboxes for one image and write the result as XML.
 
-    If *predictor* is given, uses SAM 2; otherwise falls back to watershed.
+    Returns the number of objects written (0 if skipped).
     """
     img = cv2.imread(str(img_path))
     if img is None:
         return 0
 
-    points = parse_points(xml_path)
+    points = parse_points(ann_xml_path)
     if not points:
         return 0
 
@@ -290,18 +367,38 @@ def process_image(
     else:
         bboxes = compute_bboxes_watershed(img, points)
 
+    xml_out = XML_DIR / (img_path.stem + ".xml")
+    write_bbox_xml(xml_out, img_path, img.shape, points, bboxes)
+    return len(points)
+
+
+# ── Phase 2: read XML → draw annotated image ───────────────────────────────────
+
+def draw_annotated_image(img_path: Path, bbox_xml_path: Path, out_path: Path) -> int:
+    """Read a bbox XML and draw centres + bboxes on the image.
+
+    Returns the number of objects drawn (0 if skipped).
+    """
+    img = cv2.imread(str(img_path))
+    if img is None:
+        return 0
+
+    entries = parse_bbox_xml(bbox_xml_path)
+    if not entries:
+        return 0
+
     vis = img.copy()
-    for (cx, cy), (bx, by, bw, bh) in zip(points, bboxes):
-        cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), BBOX_COLOR, BBOX_THICKNESS)
+    for (cx, cy), (xmin, ymin, xmax, ymax) in entries:
+        cv2.rectangle(vis, (xmin, ymin), (xmax, ymax), BBOX_COLOR, BBOX_THICKNESS)
         cv2.circle(vis, (cx, cy), DOT_RADIUS, DOT_COLOR, -1)
         cv2.circle(vis, (cx, cy), DOT_RADIUS + 1, (255, 255, 255), 1)
 
-    label = f"count: {len(points)}"
+    label = f"count: {len(entries)}"
     cv2.putText(vis, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, TEXT_COLOR, 2)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(out_path), vis, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    return len(points)
+    return len(entries)
 
 
 # ── main ───────────────────────────────────────────────────────────────────────
@@ -333,20 +430,34 @@ def main() -> None:
         print("SAM 2 model ready.")
 
     print(f"Found {len(img_files)} images.  Method: {args.method}.")
-    print(f"Saving bbox-annotated copies to {OUT_DIR} …")
+
+    # ── Phase 1: compute bboxes and write XML ──────────────────────────────
+    print(f"Phase 1 – writing bbox XML to {XML_DIR} …")
     skipped = 0
     for img_path in img_files:
-        xml_path = ANN_DIR / (img_path.stem + ".xml")
-        if not xml_path.exists():
+        ann_xml = ANN_DIR / (img_path.stem + ".xml")
+        if not ann_xml.exists():
             skipped += 1
             continue
-        out_path = OUT_DIR / img_path.name
-        count = process_image(img_path, xml_path, out_path, predictor=predictor)
-        print(f"  {img_path.name}  →  {count} bboxes", flush=True)
+        count = generate_bbox_xml(img_path, ann_xml, predictor=predictor)
+        print(f"  {img_path.name}  →  {count} bboxes (xml)", flush=True)
 
     if skipped:
-        print(f"\nSkipped {skipped} image(s) with no matching annotation file.")
-    print("Done.")
+        print(f"  Skipped {skipped} image(s) with no matching annotation file.")
+
+    # ── Phase 2: read XML and draw annotated images ────────────────────────
+    print(f"Phase 2 – drawing annotated images to {OUT_DIR} …")
+    drawn = 0
+    for img_path in img_files:
+        bbox_xml = XML_DIR / (img_path.stem + ".xml")
+        if not bbox_xml.exists():
+            continue
+        out_path = OUT_DIR / img_path.name
+        count = draw_annotated_image(img_path, bbox_xml, out_path)
+        print(f"  {img_path.name}  →  {count} annotations drawn", flush=True)
+        drawn += 1
+
+    print(f"Done. {drawn} annotated image(s) saved.")
 
 
 if __name__ == "__main__":
