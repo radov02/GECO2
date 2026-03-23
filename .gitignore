@@ -108,3 +108,17 @@ IOCfish5kDataset/annotations/**
 IOCfish5kDataset/images/**
 !IOCfish5kDataset/annotations/.gitkeep
 !IOCfish5kDataset/images/.gitkeep
+IOCfish5kDataset/images2/**
+!IOCfish5kDataset/images2/.gitkeep
+
+# ======================
+# IOCfish5k-D Dataset
+# ======================
+!IOCfish5k-DDataset/color/.gitkeep
+IOCfish5k-DDataset/color/**
+!IOCfish5k-DDataset/depthmaps/.gitkeep
+IOCfish5k-DDataset/depthmaps/**
+!IOCfish5k-DDataset/depthmaps-color/.gitkeep
+IOCfish5k-DDataset/depthmaps-color/**
+!IOCfish5k-DDataset/grey/.gitkeep
+IOCfish5k-DDataset/grey/**
