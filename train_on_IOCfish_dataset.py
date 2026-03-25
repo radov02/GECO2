@@ -1,6 +1,7 @@
 import argparse
 import os
 import random
+from pathlib import Path
 from time import perf_counter
 
 import numpy as np
@@ -326,7 +327,48 @@ def train(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser('CNT', parents=[get_argparser()])
+    _script_dir = Path(__file__).resolve().parent
+
+    parser = argparse.ArgumentParser('GECO2-IOCfish', parents=[get_argparser()])
+
+    # ── IOCfish-specific defaults (all in one place) ───────────────────────
+    # These override the generic argparser defaults; any CLI flag still wins.
+    parser.set_defaults(
+        model_name='GECO2_IOCfish',
+        model_name_resumed='GECO2_IOCfish',
+        data_path=str(_script_dir / 'IOCfish5kDataset' / 'done'),
+        model_path=str(_script_dir / 'models'),
+        # Architecture (must match the checkpoint you load / want to save)
+        backbone='SAM',
+        reduction=16,
+        image_size=1024,
+        num_enc_layers=3,
+        emb_dim=256,
+        num_heads=8,
+        kernel_dim=3,
+        num_objects=3,
+        # Training hyper-parameters
+        epochs=200,
+        lr=1e-4,
+        backbone_lr=0.0,
+        lr_drop=50,
+        weight_decay=1e-4,
+        batch_size=4,
+        dropout=0.1,
+        num_workers=8,
+        max_grad_norm=0.1,
+        tiling_p=0.5,
+        # Loss coefficients
+        giou_loss_coef=2,
+        cost_class=2,
+        cost_bbox=1,
+        cost_giou=2,
+        focal_alpha=0.25,
+        aux_weight=0.3,
+    )
+
     args = parser.parse_args()
+    # Ensure the model output directory exists
+    Path(args.model_path).mkdir(parents=True, exist_ok=True)
     print(args)
     train(args)
