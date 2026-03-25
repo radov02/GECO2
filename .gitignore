@@ -110,6 +110,7 @@ IOCfish5kDataset/images/**
 !IOCfish5kDataset/images/.gitkeep
 IOCfish5kDataset/images2/**
 !IOCfish5kDataset/images2/.gitkeep
+IOCfish5kDataset/done/**
 
 # ======================
 # IOCfish5k-D Dataset

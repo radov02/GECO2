@@ -1,8 +1,10 @@
 import argparse
 import json
 import os
+import xml.etree.ElementTree as ET
 import numpy as np
 import torch
+from pathlib import Path
 from PIL import Image
 from pycocotools.coco import COCO
 from scipy.ndimage import gaussian_filter
@@ -249,4 +251,176 @@ class FSC147DATASET(Dataset):
             img_name = v["file_name"]
             map_name_2_id[img_name] = img_id
         return map_name_2_id
+
+
+class IOCFish5kDataset(Dataset):
+    """Dataset for IOCfish5k images with Pascal-VOC-style bbox XML annotations."""
+
+    def __init__(
+            self, data_path, img_size, split='train', num_objects=3,
+            tiling_p=0.5, zero_shot=False, return_ids=False, training=False,
+            train_ratio=0.8, val_ratio=0.1, seed=42
+    ):
+        self.data_path = Path(data_path)
+        self.img_size = img_size
+        self.split = split
+        self.num_objects = num_objects
+        self.tiling_p = tiling_p
+        self.zero_shot = zero_shot
+        self.training = training
+        self.horizontal_flip_p = 0.5
+        self.resize = T.Resize((img_size, img_size), antialias=True)
+        self.resize512 = T.Resize((512, 512), antialias=True)
+        self.jitter = T.RandomApply([T.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8)
+
+        # Collect IDs that have both a .jpg and a valid XML with at least one bbox
+        all_xml = sorted(self.data_path.glob('*.xml'))
+        all_ids = []
+        for xml_path in all_xml:
+            img_path = self.data_path / f'{xml_path.stem}.jpg'
+            if not img_path.exists():
+                continue
+            anns = self._parse_xml(xml_path)
+            if any(a['bbox'] is not None for a in anns):
+                all_ids.append(xml_path.stem)
+
+        # Deterministic train/val/test split
+        rng = np.random.default_rng(seed)
+        indices = rng.permutation(len(all_ids))
+        n = len(all_ids)
+        train_end = int(n * train_ratio)
+        val_end = train_end + int(n * val_ratio)
+
+        if split == 'train':
+            self.image_ids = [all_ids[i] for i in indices[:train_end]]
+        elif split == 'val':
+            self.image_ids = [all_ids[i] for i in indices[train_end:val_end]]
+        else:  # test
+            self.image_ids = [all_ids[i] for i in indices[val_end:]]
+
+    @staticmethod
+    def _parse_xml(xml_path: Path) -> list:
+        """Return list of dicts with 'center' (cx, cy) and 'bbox' [xmin,ymin,xmax,ymax]."""
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        results = []
+        for obj in root.findall('object'):
+            pt = obj.find('point')
+            bb = obj.find('bndbox')
+            cx = int(pt.findtext('x', '0')) if pt is not None else None
+            cy = int(pt.findtext('y', '0')) if pt is not None else None
+            if bb is not None:
+                bbox = [
+                    int(bb.findtext('xmin', '0')),
+                    int(bb.findtext('ymin', '0')),
+                    int(bb.findtext('xmax', '0')),
+                    int(bb.findtext('ymax', '0')),
+                ]
+            else:
+                bbox = None
+            results.append({'center': (cx, cy), 'bbox': bbox})
+        return results
+
+    @staticmethod
+    def _make_density_map(centers, img_h: int, img_w: int, sigma: float = 8.0) -> np.ndarray:
+        """Gaussian density map whose sum equals the number of objects."""
+        density = np.zeros((img_h, img_w), dtype=np.float32)
+        for cx, cy in centers:
+            if cx is None or cy is None:
+                continue
+            cx = int(min(max(cx, 0), img_w - 1))
+            cy = int(min(max(cy, 0), img_h - 1))
+            density[cy, cx] += 1.0
+        count = float(density.sum())
+        density = gaussian_filter(density, sigma=sigma)
+        if density.sum() > 0:
+            density = density / density.sum() * count
+        return density
+
+    def __getitem__(self, idx: int):
+        img_id = self.image_ids[idx]
+        img_path = self.data_path / f'{img_id}.jpg'
+        xml_path = self.data_path / f'{img_id}.xml'
+
+        img = T.ToTensor()(Image.open(img_path).convert('RGB'))
+
+        annotations = self._parse_xml(xml_path)
+        bbox_anns = [a for a in annotations if a['bbox'] is not None]
+        centers = [a['center'] for a in annotations]
+
+        gt_bboxes = torch.tensor(
+            [a['bbox'] for a in bbox_anns], dtype=torch.float32
+        )  # (N, 4)  [xmin, ymin, xmax, ymax]
+
+        _, orig_h, orig_w = img.shape
+        density_map = torch.from_numpy(
+            self._make_density_map(centers, orig_h, orig_w)
+        ).unsqueeze(0)  # (1, H, W)
+
+        # Exemplar boxes: random for train, first N for val/test
+        n_available = len(bbox_anns)
+        if n_available >= self.num_objects:
+            if self.split == 'train':
+                ex_idx = torch.randperm(n_available)[:self.num_objects]
+            else:
+                ex_idx = torch.arange(self.num_objects)
+        else:
+            ex_idx = torch.arange(n_available)
+        bboxes = gt_bboxes[ex_idx]  # (k, 4)
+        # Pad to num_objects by repeating the last box
+        if bboxes.shape[0] < self.num_objects:
+            pad = bboxes[-1:].expand(self.num_objects - bboxes.shape[0], -1)
+            bboxes = torch.cat([bboxes, pad], dim=0)
+
+        if self.split == 'train':
+            tiled = False
+            channels, original_height, original_width = img.shape
+            longer_dimension = max(original_height, original_width)
+            scaling_factor = self.img_size / longer_dimension
+            bboxes_resized = bboxes * scaling_factor
+
+            if (
+                (bboxes_resized[:, 2] - bboxes_resized[:, 0]).mean() > 30
+                and (bboxes_resized[:, 3] - bboxes_resized[:, 1]).mean() > 30
+                and torch.rand(1) < self.tiling_p
+            ):
+                tiled = True
+                tile_size = (torch.rand(1) + 1, torch.rand(1) + 1)
+                img, bboxes, density_map, gt_bboxes = tiling_augmentation(
+                    img, bboxes, self.resize,
+                    self.jitter, tile_size, self.horizontal_flip_p,
+                    gt_bboxes=gt_bboxes, density_map=density_map
+                )
+            else:
+                img = self.jitter(img)
+                img, bboxes, density_map, gt_bboxes, scaling_factor, padwh = resize_and_pad(
+                    img, bboxes, density_map, gt_bboxes=gt_bboxes, train=True
+                )
+
+            if not tiled and torch.rand(1) < self.horizontal_flip_p:
+                img = TVF.hflip(img)
+                density_map = TVF.hflip(density_map)
+                bboxes[:, [0, 2]] = self.img_size - bboxes[:, [2, 0]]
+                gt_bboxes[:, [0, 2]] = self.img_size - gt_bboxes[:, [2, 0]]
+        else:
+            img, bboxes, density_map, gt_bboxes, scaling_factor, padwh = resize_and_pad(
+                img, bboxes, density_map, gt_bboxes=gt_bboxes
+            )
+
+        original_sum = density_map.sum()
+        density_map = self.resize512(density_map)
+        if density_map.sum() > 0:
+            density_map = density_map / density_map.sum() * original_sum
+
+        gt_bboxes = torch.clamp(gt_bboxes, min=0, max=1024)
+
+        img = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(img)
+
+        if self.split == 'train' or self.training:
+            return img, bboxes, density_map, torch.tensor(idx), gt_bboxes
+        else:
+            return img, bboxes, density_map, torch.tensor(idx), gt_bboxes, torch.tensor(scaling_factor), padwh
+
+    def __len__(self):
+        return len(self.image_ids)
 

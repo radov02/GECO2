@@ -21,6 +21,8 @@ import numpy as np
 import xml.etree.ElementTree as ET
 import ctypes
 import time
+import sys
+import shutil
 from pathlib import Path
 
 # Ensure physical pixel coordinates on high-DPI displays
@@ -31,6 +33,7 @@ BASE_DIR  = Path(__file__).resolve().parent
 IMG_DIR   = BASE_DIR / "images2"
 DEPTH_DIR = BASE_DIR.parent / "IOCfish5k-DDataset" / "color"
 XML_DIR   = IMG_DIR / "xml"
+DONE_DIR  = BASE_DIR / "done"
 
 # ── visual settings ────────────────────────────────────────────────────────────
 BBOX_COLOR     = (0, 255, 0)       # green – untouched boxes
@@ -838,14 +841,18 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
 
 # ── Image loading ──────────────────────────────────────────────────────────────
 
-def load_image(state: AnnotationState, img_id: str) -> None:
+def load_image(state: AnnotationState, img_id: str,
+               img_source_dir: Path | None = None,
+               xml_source_dir: Path | None = None) -> None:
     """Load an image pair + its annotations into *state*."""
     if state.dirty:
         state.save()
 
-    img_path   = BASE_DIR / "images" / "unannotated" / f"{img_id}.jpg"
+    _img_dir = img_source_dir if img_source_dir is not None else (BASE_DIR / "images" / "unannotated")
+    _xml_dir = xml_source_dir if xml_source_dir is not None else XML_DIR
+    img_path   = _img_dir / f"{img_id}.jpg"
     depth_path = DEPTH_DIR / f"{img_id}.jpg"
-    xml_path   = XML_DIR  / f"{img_id}.xml"
+    xml_path   = _xml_dir / f"{img_id}.xml"
 
     state.img_path = img_path
     state.xml_path = xml_path
@@ -890,10 +897,11 @@ def load_image(state: AnnotationState, img_id: str) -> None:
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-def main() -> None:
-    xml_files_raw = sorted(XML_DIR.glob("*.xml"))
+def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None) -> None:
+    _xml_dir = xml_source_dir if xml_source_dir is not None else XML_DIR
+    xml_files_raw = sorted(_xml_dir.glob("*.xml"))
     if not xml_files_raw:
-        print(f"No XML files found in {XML_DIR}")
+        print(f"No XML files found in {_xml_dir}")
         return
 
     state = AnnotationState()
@@ -926,9 +934,16 @@ def main() -> None:
     total = len(image_ids)
     print(f"Found {total} annotated images")
 
+    # Start on the last Done image (if any exist)
+    last_done = next(
+        (i for i in range(len(image_ids) - 1, -1, -1) if image_ids[i] in done_ids),
+        0,
+    )
+    cur = last_done
+
     cv2.setMouseCallback(win, on_mouse, (state, app))
 
-    load_image(state, image_ids[cur])
+    load_image(state, image_ids[cur], img_source_dir=img_source_dir, xml_source_dir=xml_source_dir)
 
     while True:
         # ── detect window close (X button) ─────────────────────────────────
@@ -957,7 +972,7 @@ def main() -> None:
             app["nav"] = 0
             if 0 <= new_cur < total:
                 cur = new_cur
-                load_image(state, image_ids[cur])
+                load_image(state, image_ids[cur], img_source_dir=img_source_dir, xml_source_dir=xml_source_dir)
 
         # ── handle Done toggle ─────────────────────────────────────────────
         if app["toggle_done"]:
@@ -983,12 +998,12 @@ def main() -> None:
         elif key in (ord("d"), ord("D"), KEY_RIGHT):  # next
             if cur < total - 1:
                 cur += 1
-                load_image(state, image_ids[cur])
+                load_image(state, image_ids[cur], img_source_dir=img_source_dir, xml_source_dir=xml_source_dir)
 
         elif key in (ord("a"), ord("A"), KEY_LEFT):   # prev
             if cur > 0:
                 cur -= 1
-                load_image(state, image_ids[cur])
+                load_image(state, image_ids[cur], img_source_dir=img_source_dir, xml_source_dir=xml_source_dir)
 
         elif key in (ord("s"), ord("S")):             # save
             state.save()
@@ -1006,5 +1021,44 @@ def main() -> None:
     print("Done.")
 
 
+# ── Done-search CLI mode ──────────────────────────────────────────────────────
+
+def donesearch() -> None:
+    """Find all Done-flagged XMLs and copy them + their images to done/."""
+    done_dir = BASE_DIR / "done"
+    done_dir.mkdir(parents=True, exist_ok=True)
+
+    xml_files = sorted(XML_DIR.glob("*.xml"))
+    if not xml_files:
+        print(f"No XML files found in {XML_DIR}")
+        return
+
+    found = 0
+    for xml_path in xml_files:
+        _, is_done = _scan_xml_fast(xml_path)
+        if not is_done:
+            continue
+        img_id = xml_path.stem
+        img_path = BASE_DIR / "images" / "unannotated" / f"{img_id}.jpg"
+
+        dst_xml = done_dir / xml_path.name
+        shutil.copy2(xml_path, dst_xml)
+
+        if img_path.exists():
+            dst_img = done_dir / img_path.name
+            shutil.copy2(img_path, dst_img)
+            print(f"  {img_id}: image + xml copied")
+        else:
+            print(f"  {img_id}: xml copied (image not found at {img_path})")
+        found += 1
+
+    print(f"\nDone-search complete: {found} annotated image(s) copied to {done_dir}")
+
+
 if __name__ == "__main__":
-    main()
+    if "--donesearch" in sys.argv:
+        donesearch()
+    elif "--showdone" in sys.argv:
+        main(xml_source_dir=DONE_DIR, img_source_dir=DONE_DIR)
+    else:
+        main()
