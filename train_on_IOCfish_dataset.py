@@ -133,6 +133,13 @@ def train(args):
     )
 
     print(rank)
+    model_path_abs = os.path.abspath(os.path.join(args.model_path, f'{args.model_name}.pth'))
+    txt_path = os.path.abspath(os.path.join(args.model_path, f'{args.model_name}_metrics.txt'))
+    if rank == 0:
+        with open(txt_path, 'w') as f:
+            f.write(f"Model path: {model_path_abs}\n")
+            f.write(f"\n{'Epoch':>6s}  {'TrainLoss':>10s}  {'ValLoss':>8s}  {'TrainMAE':>9s}  {'ValMAE':>7s}  {'ValRMSE':>8s}  {'TestMAE':>8s}  {'TestRMSE':>9s}  Best\n")
+            f.write('-' * 88 + '\n')
     for epoch in range(start_epoch + 1, args.epochs + 1):
         if rank == 0:
             start = perf_counter()
@@ -323,6 +330,7 @@ def train(args):
                 }
 
             print(
+                f"-----------------------------------------------",
                 f"Epoch: {epoch}",
                 f"Train loss: {train_loss.item():.3f}",
                 f"Val loss: {val_loss.item():.3f}",
@@ -334,21 +342,28 @@ def train(args):
                 f"Epoch time: {end - start:.3f} seconds",
                 'best' if best_epoch else ''
             )
+            with open(txt_path, 'a') as f:
+                f.write(
+                    f"{epoch:>6d}  {train_loss.item():>10.3f}  {val_loss.item():>8.3f}  "
+                    f"{train_ae.item() / len(train_dataset):>9.3f}  "
+                    f"{val_ae.item() / len(val_dataset):>7.3f}  "
+                    f"{torch.sqrt(val_rmse / len(val_dataset)).item():>8.2f}  "
+                    f"{test_ae.item() / len(test_dataset):>8.3f}  "
+                    f"{torch.sqrt(test_rmse / len(test_dataset)).item():>9.2f}  "
+                    f"{'*' if best_epoch else ''}\n"
+                )
     dist.destroy_process_group()
 
     if rank == 0 and best_metrics is not None:
-        model_path = os.path.abspath(os.path.join(args.model_path, f'{args.model_name}.pth'))
-        txt_path = os.path.abspath(os.path.join(args.model_path, f'{args.model_name}_metrics.txt'))
-        with open(txt_path, 'w') as f:
-            f.write(f"Model path: {model_path}\n")
-            f.write(f"Best epoch: {best_metrics['epoch']}\n")
-            f.write(f"Train loss: {best_metrics['train_loss']:.3f}\n")
-            f.write(f"Val loss:   {best_metrics['val_loss']:.3f}\n")
-            f.write(f"Train MAE:  {best_metrics['train_mae']:.3f}\n")
-            f.write(f"Val MAE:    {best_metrics['val_mae']:.3f}\n")
-            f.write(f"Val RMSE:   {best_metrics['val_rmse']:.2f}\n")
-            f.write(f"Test MAE:   {best_metrics['test_mae']:.3f}\n")
-            f.write(f"Test RMSE:  {best_metrics['test_rmse']:.2f}\n")
+        with open(txt_path, 'a') as f:
+            f.write(f"\nBest model — epoch {best_metrics['epoch']}:\n")
+            f.write(f"  Train loss: {best_metrics['train_loss']:.3f}\n")
+            f.write(f"  Val loss:   {best_metrics['val_loss']:.3f}\n")
+            f.write(f"  Train MAE:  {best_metrics['train_mae']:.3f}\n")
+            f.write(f"  Val MAE:    {best_metrics['val_mae']:.3f}\n")
+            f.write(f"  Val RMSE:   {best_metrics['val_rmse']:.2f}\n")
+            f.write(f"  Test MAE:   {best_metrics['test_mae']:.3f}\n")
+            f.write(f"  Test RMSE:  {best_metrics['test_rmse']:.2f}\n")
         print(f"Metrics saved to: {txt_path}")
 
 

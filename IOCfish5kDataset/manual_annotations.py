@@ -17,12 +17,14 @@ Controls
 """
 
 import cv2
+import re
 import numpy as np
 import xml.etree.ElementTree as ET
 import ctypes
 import time
 import sys
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Ensure physical pixel coordinates on high-DPI displays
@@ -151,15 +153,121 @@ def save_bbox_xml(
 
 # ── Done-state helpers ────────────────────────────────────────────────────────
 
-def _scan_xml_fast(xml_path: Path) -> tuple[int, bool]:
-    """Return (bbox_count, is_done) by fast text scan — no XML parse overhead."""
+_RE_DONE  = re.compile(r"<done>1</done>")
+_RE_XMIN  = re.compile(r"<xmin>(\d+)</xmin>")
+_RE_YMIN  = re.compile(r"<ymin>(\d+)</ymin>")
+_RE_XMAX  = re.compile(r"<xmax>(\d+)</xmax>")
+_RE_YMAX  = re.compile(r"<ymax>(\d+)</ymax>")
+_RE_CX    = re.compile(r"<x>(\d+)</x>")
+_RE_CY    = re.compile(r"<y>(\d+)</y>")
+
+
+def _scan_xml(xml_path: Path) -> tuple[int, bool, float, float]:
+    """Single text-read: return (bbox_count, is_done, avg_pairwise_iou, center_inside_ratio)."""
     try:
         text = xml_path.read_text(encoding="utf-8", errors="ignore")
-        count = text.count("<object>")
-        done  = "<done>1</done>" in text
-        return count, done
     except OSError:
-        return 0, False
+        return 0, False, 0.0, 1.0
+
+    count = text.count("<object>")
+    is_done = bool(_RE_DONE.search(text))
+
+    if is_done:
+        return count, is_done, 0.0, 1.0
+
+    xmins = [int(v) for v in _RE_XMIN.findall(text)]
+    ymins = [int(v) for v in _RE_YMIN.findall(text)]
+    xmaxs = [int(v) for v in _RE_XMAX.findall(text)]
+    ymaxs = [int(v) for v in _RE_YMAX.findall(text)]
+    cxs = [int(v) for v in _RE_CX.findall(text)]
+    cys = [int(v) for v in _RE_CY.findall(text)]
+    n = min(len(xmins), len(ymins), len(xmaxs), len(ymaxs))
+    nc = min(len(cxs), len(cys), n)
+
+    # Center-inside ratio
+    if nc > 0:
+        inside = sum(1 for i in range(nc)
+                     if xmins[i] <= cxs[i] <= xmaxs[i] and ymins[i] <= cys[i] <= ymaxs[i])
+        center_ratio = inside / nc
+    else:
+        center_ratio = 1.0
+
+    if n < 2:
+        return count, is_done, 0.0, center_ratio
+
+    # Average pairwise IoU
+    total_iou = 0.0
+    num_pairs = 0
+    for i in range(n):
+        a = (xmins[i], ymins[i], xmaxs[i], ymaxs[i])
+        a_area = (a[2] - a[0]) * (a[3] - a[1])
+        if a_area <= 0:
+            continue
+        for j in range(i + 1, n):
+            b = (xmins[j], ymins[j], xmaxs[j], ymaxs[j])
+            b_area = (b[2] - b[0]) * (b[3] - b[1])
+            if b_area <= 0:
+                continue
+            ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
+            ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            if inter == 0:
+                continue
+            iou = inter / (a_area + b_area - inter)
+            total_iou += iou
+            num_pairs += 1
+    avg_iou = total_iou / num_pairs if num_pairs > 0 else 0.0
+    return count, is_done, avg_iou, center_ratio
+
+
+def _scan_xml_fast(xml_path: Path) -> tuple[int, bool]:
+    """Thin wrapper kept for callers that only need (count, is_done)."""
+    count, is_done, _, _ = _scan_xml(xml_path)
+    return count, is_done
+
+
+def _compute_iou(box1: list[int], box2: list[int]) -> float:
+    """IoU between two [xmin, ymin, xmax, ymax] boxes."""
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _avg_pairwise_iou(annotations: list[dict]) -> float:
+    """Return the average pairwise IoU among all annotated bboxes."""
+    bboxes = [a["bbox"] for a in annotations if a["bbox"] is not None]
+    if len(bboxes) < 2:
+        return 0.0
+    total = 0.0
+    count = 0
+    for i in range(len(bboxes)):
+        for j in range(i + 1, len(bboxes)):
+            total += _compute_iou(bboxes[i], bboxes[j])
+            count += 1
+    return total / count if count > 0 else 0.0
+
+
+def _center_inside_ratio(annotations: list[dict]) -> float:
+    """Return the fraction of annotations whose center is inside their bbox."""
+    valid = [a for a in annotations if a["bbox"] is not None]
+    if not valid:
+        return 1.0
+    inside = sum(1 for a in valid
+                 if a["bbox"][0] <= a["center"][0] <= a["bbox"][2]
+                 and a["bbox"][1] <= a["center"][1] <= a["bbox"][3])
+    return inside / len(valid)
+
+
+def _avg_iou_from_xml(xml_path: Path) -> float:
+    """Fast regex-based avg pairwise IoU (no XML parser)."""
+    _, _, iou, _ = _scan_xml(xml_path)
+    return iou
 
 
 def set_done_in_xml(xml_path: Path, done: bool) -> None:
@@ -388,7 +496,7 @@ def _warp_matrix(state: AnnotationState) -> np.ndarray:
                        [0, es, -vt * es]])
 
 
-def render(state: AnnotationState, cur_idx: int, total: int, is_done: bool = False) -> np.ndarray:
+def render(state: AnnotationState, cur_idx: int, total: int, is_done: bool = False, app: dict | None = None) -> np.ndarray:
     w, h = state.win_w, state.win_h
     if w <= 0 or h <= 0:
         return np.zeros((1, 1, 3), dtype=np.uint8)
@@ -586,12 +694,43 @@ def render(state: AnnotationState, cur_idx: int, total: int, is_done: bool = Fal
     cv2.putText(canvas, done_label, (tx_d, ty_d),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (210, 210, 210), 1, cv2.LINE_AA)
 
+    # Jump-to input field
+    if app is not None:
+        jmp_label = "Go#"
+        jmp_lbl_ts = cv2.getTextSize(jmp_label, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)[0]
+        bx_jmp = bx_done + bw_done + 16
+        jmp_field_w = 60
+        jmp_active = app.get("jump_active", False)
+        jmp_text = app.get("jump_text", "")
+        # Label
+        cv2.putText(canvas, jmp_label, (bx_jmp, by + (bh + jmp_lbl_ts[1]) // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 180, 180), 1, cv2.LINE_AA)
+        # Input box
+        fx = bx_jmp + jmp_lbl_ts[0] + 4
+        border_col = (100, 200, 255) if jmp_active else (120, 120, 120)
+        bg_col = (60, 60, 60) if jmp_active else (50, 50, 50)
+        cv2.rectangle(canvas, (fx, by), (fx + jmp_field_w, by + bh), bg_col, -1)
+        cv2.rectangle(canvas, (fx, by), (fx + jmp_field_w, by + bh), border_col, 1)
+        # Text inside field
+        display_txt = jmp_text if jmp_text else ""
+        if jmp_active:
+            display_txt += "|"
+        txt_ts = cv2.getTextSize(display_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)[0]
+        cv2.putText(canvas, display_txt, (fx + 4, by + (bh + txt_ts[1]) // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
+        # Store field geometry for mouse click detection
+        app["_jmp_field_rect"] = (fx, by, fx + jmp_field_w, by + bh)
+
     # Status text
+    max_iou = _avg_pairwise_iou(state.annotations)
+    cir = _center_inside_ratio(state.annotations)
     name = state.img_path.stem if state.img_path else "?"
     modified = " *" if state.dirty else ""
     done_mark = "  [DONE]" if is_done else ""
     zoom_pct = int(state.zoom * 100)
-    info = f"{name}{modified}{done_mark}  |  {cur_idx + 1}/{total}  |  Boxes: {len(state.annotations)}  |  {zoom_pct}%"
+    iou_str = f"  |  AvgIoU: {max_iou:.2f}" if max_iou > 0 else ""
+    cir_str = f"  |  CIR: {cir:.0%}" if cir < 1.0 else ""
+    info = f"{name}{modified}{done_mark}  |  {cur_idx + 1}/{total}  |  Boxes: {len(state.annotations)}{iou_str}{cir_str}  |  {zoom_pct}%"
     info_col = (80, 210, 80) if is_done else (200, 200, 200)
     cv2.putText(canvas, info, (8, bar_y + 24),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, info_col, 1, cv2.LINE_AA)
@@ -600,6 +739,34 @@ def render(state: AnnotationState, cur_idx: int, total: int, is_done: bool = Fal
     if is_done:
         cv2.putText(canvas, "DONE", (pw - 72, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 200, 0), 2, cv2.LINE_AA)
+
+    # Avg-IoU overlay (top-right of left panel, coloured by severity)
+    overlay_y = 30
+    if max_iou > 0 and not is_done:
+        if max_iou >= 0.5:
+            iou_col = (0, 0, 255)     # red – heavy overlap
+        elif max_iou >= 0.2:
+            iou_col = (0, 165, 255)   # orange – moderate
+        else:
+            iou_col = (0, 200, 200)   # yellow – mild
+        iou_overlay = f"AvgIoU {max_iou:.2f}"
+        ots = cv2.getTextSize(iou_overlay, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+        cv2.putText(canvas, iou_overlay, (pw - ots[0] - 8, overlay_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, iou_col, 2, cv2.LINE_AA)
+        overlay_y += 28
+
+    # Center-inside ratio overlay
+    if cir < 1.0 and not is_done:
+        if cir <= 0.5:
+            cir_col = (0, 0, 255)     # red – many outside
+        elif cir <= 0.8:
+            cir_col = (0, 165, 255)   # orange – some outside
+        else:
+            cir_col = (0, 200, 200)   # yellow – few outside
+        cir_overlay = f"CIR {cir:.0%}"
+        cots = cv2.getTextSize(cir_overlay, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+        cv2.putText(canvas, cir_overlay, (pw - cots[0] - 8, overlay_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, cir_col, 2, cv2.LINE_AA)
 
     nhid = len(state.hidden)
     if nhid:
@@ -693,6 +860,14 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
         bw, bh = 80, 26
         by = state.panel_h + (BUTTON_BAR_H - bh) // 2
         mid = state.win_w // 2
+        # Check jump field click first
+        jrect = app.get("_jmp_field_rect")
+        if jrect and jrect[0] <= x <= jrect[2] and jrect[1] <= y <= jrect[3]:
+            app["jump_active"] = True
+            app["jump_text"] = ""  # clear so user can type fresh
+            return
+        # Click elsewhere in bar deactivates field
+        app["jump_active"] = False
         if mid - bw - 8 <= x <= mid - 8 and by <= y <= by + bh:
             app["nav"] = -1
         elif mid + 8 <= x <= mid + 88 and by <= y <= by + bh:
@@ -895,9 +1070,121 @@ def load_image(state: AnnotationState, img_id: str,
     state.reset_view()
 
 
+# ── Fix bboxes to centers ──────────────────────────────────────────────────────
+
+def _show_splash(win: str, win_w: int, win_h: int, msg: str, elapsed: float) -> None:
+    """Draw a splash screen with message and elapsed timer."""
+    mins, secs = divmod(int(elapsed), 60)
+    _splash = np.full((win_h, win_w, 3), 30, dtype=np.uint8)
+    _ts = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 1.4, 2)[0]
+    cv2.putText(_splash, msg,
+                (win_w // 2 - _ts[0] // 2, win_h // 2 + _ts[1] // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.4, (200, 200, 200), 2, cv2.LINE_AA)
+    time_str = f"{mins}:{secs:02d}"
+    tts = cv2.getTextSize(time_str, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+    cv2.putText(_splash, time_str,
+                (win_w // 2 - tts[0] // 2, win_h // 2 + _ts[1] // 2 + 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (180, 180, 180), 2, cv2.LINE_AA)
+    cv2.imshow(win, _splash)
+    cv2.waitKey(1)
+
+
+def _fix_bboxes_to_centers(xml_files: list[Path], win: str, win_w: int, win_h: int) -> int:
+    """Fix bboxes: re-center if center outside, shrink if too many centers inside."""
+    start = time.time()
+    fixed_total = 0
+    total = len(xml_files)
+    CENTER_THRESHOLD = 10  # shrink bbox if it contains >= this many centers
+
+    for file_idx, xml_path in enumerate(xml_files):
+        _show_splash(win, win_w, win_h, f"Fixing... {file_idx + 1}/{total}", time.time() - start)
+
+        try:
+            tree = ET.parse(xml_path)
+            root = tree.getroot()
+        except Exception:
+            continue
+
+        size_el = root.find("size")
+        img_w = int(size_el.findtext("width", "0")) if size_el is not None else 0
+        img_h = int(size_el.findtext("height", "0")) if size_el is not None else 0
+
+        # Collect all center points and bbox data in one pass
+        objs = root.findall("object")
+        centers = []
+        bboxes = []
+        for obj in objs:
+            pt = obj.find("point")
+            bb = obj.find("bndbox")
+            if pt is not None:
+                centers.append((int(pt.findtext("x", "0")), int(pt.findtext("y", "0"))))
+            else:
+                centers.append(None)
+            if bb is not None:
+                bboxes.append((int(bb.findtext("xmin", "0")), int(bb.findtext("ymin", "0")),
+                               int(bb.findtext("xmax", "0")), int(bb.findtext("ymax", "0"))))
+            else:
+                bboxes.append(None)
+
+        modified = False
+        for i, obj in enumerate(objs):
+            if centers[i] is None or bboxes[i] is None:
+                continue
+            cx, cy = centers[i]
+            xmin, ymin, xmax, ymax = bboxes[i]
+            bb = obj.find("bndbox")
+
+            need_fix = False
+            # Fix 1: center point outside its bbox → shrink to 1/2 size, re-center
+            if cx < xmin or cx > xmax or cy < ymin or cy > ymax:
+                bw = (xmax - xmin) / 2
+                bh = (ymax - ymin) / 2
+                half_w = bw / 2
+                half_h = bh / 2
+                xmin = int(max(0, cx - half_w))
+                ymin = int(max(0, cy - half_h))
+                xmax = int(min(img_w, cx + half_w)) if img_w > 0 else int(cx + half_w)
+                ymax = int(min(img_h, cy + half_h)) if img_h > 0 else int(cy + half_h)
+                need_fix = True
+
+            # Fix 2: bbox contains >= CENTER_THRESHOLD center points → shrink to 1/4 size
+            if not need_fix:
+                count = sum(1 for c in centers
+                            if c is not None and xmin <= c[0] <= xmax and ymin <= c[1] <= ymax)
+                if count >= CENTER_THRESHOLD:
+                    bw = (xmax - xmin) / 4
+                    bh = (ymax - ymin) / 4
+                    half_w = bw / 2
+                    half_h = bh / 2
+                    xmin = int(max(0, cx - half_w))
+                    ymin = int(max(0, cy - half_h))
+                    xmax = int(min(img_w, cx + half_w)) if img_w > 0 else int(cx + half_w)
+                    ymax = int(min(img_h, cy + half_h)) if img_h > 0 else int(cy + half_h)
+                    need_fix = True
+
+            if need_fix:
+                bb.find("xmin").text = str(xmin)
+                bb.find("ymin").text = str(ymin)
+                bb.find("xmax").text = str(xmax)
+                bb.find("ymax").text = str(ymax)
+                # Update cached bbox so subsequent checks use new coords
+                bboxes[i] = (xmin, ymin, xmax, ymax)
+                modified = True
+                fixed_total += 1
+
+        if modified:
+            ET.indent(tree, space="  ")
+            tree.write(xml_path, encoding="unicode", xml_declaration=True)
+
+    elapsed = time.time() - start
+    print(f"Fixed {fixed_total} bbox(es) across {total} not-done image(s) in {elapsed:.1f}s")
+    return fixed_total
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None) -> None:
+def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
+         fix_bboxes: bool = False) -> None:
     _xml_dir = xml_source_dir if xml_source_dir is not None else XML_DIR
     xml_files_raw = sorted(_xml_dir.glob("*.xml"))
     if not xml_files_raw:
@@ -906,33 +1193,67 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None)
 
     state = AnnotationState()
     cur = 0
-    app = {"nav": 0, "toggle_done": False}
+    app = {"nav": 0, "toggle_done": False, "jump_text": "", "jump_active": False}
 
     win = "Manual Bbox Annotation"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, state.win_w, state.win_h)
 
-    # Show "Sorting..." splash while scanning + sorting
-    _splash = np.full((state.win_h, state.win_w, 3), 30, dtype=np.uint8)
-    _msg = "Sorting..."
-    _ts = cv2.getTextSize(_msg, cv2.FONT_HERSHEY_SIMPLEX, 1.4, 2)[0]
-    cv2.putText(_splash, _msg,
-                (state.win_w // 2 - _ts[0] // 2, state.win_h // 2 + _ts[1] // 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.4, (200, 200, 200), 2, cv2.LINE_AA)
-    cv2.imshow(win, _splash)
-    cv2.waitKey(1)
+    # ── Fix bboxes to centers (if requested) ───────────────────────────────
+    if fix_bboxes:
+        # Quick parallel check for done status
+        with ThreadPoolExecutor() as pool:
+            done_flags = list(pool.map(lambda f: _RE_DONE.search(
+                f.read_text(encoding="utf-8", errors="ignore")), xml_files_raw))
+        notdone_xml = [f for f, d in zip(xml_files_raw, done_flags) if not d]
+        if notdone_xml:
+            _fix_bboxes_to_centers(notdone_xml, win, state.win_w, state.win_h)
 
-    # Fast scan: bbox count + done flag in one text read per file
-    scan_results = [_scan_xml_fast(f) for f in xml_files_raw]
-    xml_files = [f for f, _ in sorted(zip(xml_files_raw, scan_results),
-                                      key=lambda pair: pair[1][0])]
+    # ── Sorting with timer splash ──────────────────────────────────────────
+    sort_start = time.time()
+    _show_splash(win, state.win_w, state.win_h, "Sorting...", 0)
+
+    # Parallel scan: one file read per XML – (count, is_done, avg_iou, center_ratio) in one pass
+    with ThreadPoolExecutor() as pool:
+        futures = {pool.submit(_scan_xml, f): i for i, f in enumerate(xml_files_raw)}
+        scan_results = [None] * len(xml_files_raw)
+        completed = 0
+        for future in as_completed(futures):
+            idx = futures[future]
+            scan_results[idx] = future.result()
+            completed += 1
+            if completed % 20 == 0 or completed == len(xml_files_raw):
+                _show_splash(win, state.win_w, state.win_h,
+                             f"Sorting... {completed}/{len(xml_files_raw)}",
+                             time.time() - sort_start)
     done_ids: set[str] = {
-        f.stem for f, (_, is_done) in zip(xml_files_raw, scan_results) if is_done
+        f.stem for f, (_, is_done, _iou, _cir) in zip(xml_files_raw, scan_results) if is_done
     }
+
+    # Separate done vs not-done; metrics already computed in scan
+    done_files = []
+    notdone_files = []
+    for f, (count, is_done, avg_iou, center_ratio) in zip(xml_files_raw, scan_results):
+        if is_done:
+            done_files.append((f, count))
+        else:
+            notdone_files.append((f, count, avg_iou, center_ratio))
+
+    # Sort done by bbox count (ascending)
+    # Sort not-done by avg IoU descending, then center-inside ratio ascending
+    done_files.sort(key=lambda x: x[1])
+    notdone_files.sort(key=lambda x: (-x[2], x[3]))
+
+    xml_files = [f for f, _ in done_files] + [f for f, _, _, _ in notdone_files]
 
     image_ids = [f.stem for f in xml_files]
     total = len(image_ids)
-    print(f"Found {total} annotated images")
+    print(f"Found {total} annotated images ({len(done_files)} done, {len(notdone_files)} not done)")
+    if notdone_files:
+        top = notdone_files[:min(5, len(notdone_files))]
+        print("Top not-done by AvgIoU (desc):")
+        for f, cnt, iou, cir in top:
+            print(f"  {f.stem}: IoU={iou:.3f}  CIR={cir:.0%}  boxes={cnt}")
 
     # Start on the last Done image (if any exist)
     last_done = next(
@@ -940,6 +1261,7 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None)
         0,
     )
     cur = last_done
+    app["jump_text"] = str(last_done + 1)  # 1-based default
 
     cv2.setMouseCallback(win, on_mouse, (state, app))
 
@@ -984,11 +1306,47 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None)
             else:
                 done_ids.add(cur_id)
                 set_done_in_xml(state.xml_path, True)
+            # Update jump_text default to latest last-done position
+            ld = next(
+                (i for i in range(len(image_ids) - 1, -1, -1) if image_ids[i] in done_ids),
+                0,
+            )
+            if not app["jump_active"]:
+                app["jump_text"] = str(ld + 1)
 
         # ── render & display ───────────────────────────────────────────────
-        canvas = render(state, cur, total, image_ids[cur] in done_ids)
+        canvas = render(state, cur, total, image_ids[cur] in done_ids, app=app)
         cv2.imshow(win, canvas)
         key = cv2.waitKeyEx(16)
+
+        # ── jump field keyboard handling ───────────────────────────────────
+        if app["jump_active"] and key != -1:
+            if key == 27:                             # Escape – deactivate
+                app["jump_active"] = False
+                ld = next(
+                    (i for i in range(total - 1, -1, -1) if image_ids[i] in done_ids),
+                    0,
+                )
+                app["jump_text"] = str(ld + 1)
+            elif key == 13:                           # Enter – jump
+                try:
+                    target = int(app["jump_text"]) - 1  # 1-based → 0-based
+                    if 0 <= target < total:
+                        cur = target
+                        load_image(state, image_ids[cur], img_source_dir=img_source_dir, xml_source_dir=xml_source_dir)
+                except ValueError:
+                    pass
+                app["jump_active"] = False
+                ld = next(
+                    (i for i in range(total - 1, -1, -1) if image_ids[i] in done_ids),
+                    0,
+                )
+                app["jump_text"] = str(ld + 1)
+            elif key == 8:                            # Backspace
+                app["jump_text"] = app["jump_text"][:-1]
+            elif ord("0") <= key <= ord("9"):
+                app["jump_text"] += chr(key)
+            continue
 
         if key in (ord("q"), ord("Q"), 27):           # Q / Escape
             if state.dirty:
@@ -1056,9 +1414,10 @@ def donesearch() -> None:
 
 
 if __name__ == "__main__":
+    _fix_flag = "--fixbboxestocenters" in sys.argv
     if "--donesearch" in sys.argv:
         donesearch()
     elif "--showdone" in sys.argv:
-        main(xml_source_dir=DONE_DIR, img_source_dir=DONE_DIR)
+        main(xml_source_dir=DONE_DIR, img_source_dir=DONE_DIR, fix_bboxes=_fix_flag)
     else:
-        main()
+        main(fix_bboxes=_fix_flag)
