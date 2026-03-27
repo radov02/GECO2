@@ -76,6 +76,7 @@ def train(args):
     else:
         start_epoch = 0
         best = 10000000000000
+    best_metrics = None
     matcher = build_matcher(args)
     criterion = SetCriterion(0, matcher, {"loss_giou": args.giou_loss_coef}, ["bboxes", "ce"],
                              focal_alpha=args.focal_alpha)
@@ -310,6 +311,16 @@ def train(args):
                 )
 
                 best_epoch = True
+                best_metrics = {
+                    'epoch': epoch,
+                    'train_loss': train_loss.item(),
+                    'val_loss': val_loss.item(),
+                    'train_mae': train_ae.item() / len(train_dataset),
+                    'val_mae': val_ae.item() / len(val_dataset),
+                    'val_rmse': torch.sqrt(val_rmse / len(val_dataset)).item(),
+                    'test_mae': test_ae.item() / len(test_dataset),
+                    'test_rmse': torch.sqrt(test_rmse / len(test_dataset)).item(),
+                }
 
             print(
                 f"Epoch: {epoch}",
@@ -324,6 +335,21 @@ def train(args):
                 'best' if best_epoch else ''
             )
     dist.destroy_process_group()
+
+    if rank == 0 and best_metrics is not None:
+        model_path = os.path.abspath(os.path.join(args.model_path, f'{args.model_name}.pth'))
+        txt_path = os.path.abspath(os.path.join(args.model_path, f'{args.model_name}_metrics.txt'))
+        with open(txt_path, 'w') as f:
+            f.write(f"Model path: {model_path}\n")
+            f.write(f"Best epoch: {best_metrics['epoch']}\n")
+            f.write(f"Train loss: {best_metrics['train_loss']:.3f}\n")
+            f.write(f"Val loss:   {best_metrics['val_loss']:.3f}\n")
+            f.write(f"Train MAE:  {best_metrics['train_mae']:.3f}\n")
+            f.write(f"Val MAE:    {best_metrics['val_mae']:.3f}\n")
+            f.write(f"Val RMSE:   {best_metrics['val_rmse']:.2f}\n")
+            f.write(f"Test MAE:   {best_metrics['test_mae']:.3f}\n")
+            f.write(f"Test RMSE:  {best_metrics['test_rmse']:.2f}\n")
+        print(f"Metrics saved to: {txt_path}")
 
 
 if __name__ == '__main__':
@@ -348,8 +374,8 @@ if __name__ == '__main__':
         kernel_dim=3,
         num_objects=3,
         # Training hyper-parameters
-        epochs=200,
-        lr=1e-4,
+        epochs=10,
+        lr=1e-5,
         backbone_lr=0.0,
         lr_drop=50,
         weight_decay=1e-4,
