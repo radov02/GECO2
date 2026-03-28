@@ -47,7 +47,7 @@ DOT_RADIUS     = 3                 # fixed display pixels
 HANDLE_RADIUS  = 4                 # small square handles
 HANDLE_COLOR   = (255, 255, 0)     # cyan handles
 GRAB_RADIUS    = 10                # display-px grab threshold
-BUTTON_BAR_H   = 36
+BUTTON_BAR_H   = 52
 
 # ── Arrow key codes (OpenCV waitKeyEx on Windows) ──────────────────────────────
 KEY_LEFT  = 2424832
@@ -339,6 +339,7 @@ class AnnotationState:
         self.hidden_stack: list[int] = []  # undo stack for hide operations
         self.hover_idx = -1  # index of bbox under cursor
         self.load_time = time.time()  # timestamp when image was loaded
+        self.session_elapsed: float = 0.0  # accumulated time across all images
 
         # Pan interaction
         self.panning = False
@@ -669,35 +670,35 @@ def render(state: AnnotationState, cur_idx: int, total: int, is_done: bool = Fal
     canvas[bar_y:, :] = 45
 
     # Prev / Next buttons
-    bw, bh = 80, 26
+    bw, bh = 96, 38
     by = bar_y + (BUTTON_BAR_H - bh) // 2
     mid = w // 2
     for label, bx in [("< Prev", mid - bw - 8), ("Next >", mid + 8)]:
         cv2.rectangle(canvas, (bx, by), (bx + bw, by + bh), (90, 90, 90), -1)
         cv2.rectangle(canvas, (bx, by), (bx + bw, by + bh), (160, 160, 160), 1)
-        ts = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
+        ts = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)[0]
         tx = bx + (bw - ts[0]) // 2
         ty = by + (bh + ts[1]) // 2
         cv2.putText(canvas, label, (tx, ty),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (210, 210, 210), 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (210, 210, 210), 1, cv2.LINE_AA)
 
     # Done! toggle button
-    bw_done = 72
-    bx_done = mid + 100
+    bw_done = 90
+    bx_done = mid + 112
     done_col = (0, 140, 0) if is_done else (90, 90, 90)
     done_label = "Undone" if is_done else "Done!"
     cv2.rectangle(canvas, (bx_done, by), (bx_done + bw_done, by + bh), done_col, -1)
     cv2.rectangle(canvas, (bx_done, by), (bx_done + bw_done, by + bh), (160, 160, 160), 1)
-    ts_d = cv2.getTextSize(done_label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
+    ts_d = cv2.getTextSize(done_label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)[0]
     tx_d = bx_done + (bw_done - ts_d[0]) // 2
     ty_d = by + (bh + ts_d[1]) // 2
     cv2.putText(canvas, done_label, (tx_d, ty_d),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (210, 210, 210), 1, cv2.LINE_AA)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (210, 210, 210), 1, cv2.LINE_AA)
 
     # Jump-to input field
     if app is not None:
         jmp_label = "Go#"
-        jmp_lbl_ts = cv2.getTextSize(jmp_label, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)[0]
+        jmp_lbl_ts = cv2.getTextSize(jmp_label, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)[0]
         bx_jmp = bx_done + bw_done + 16
         jmp_field_w = 60
         jmp_active = app.get("jump_active", False)
@@ -715,9 +716,9 @@ def render(state: AnnotationState, cur_idx: int, total: int, is_done: bool = Fal
         display_txt = jmp_text if jmp_text else ""
         if jmp_active:
             display_txt += "|"
-        txt_ts = cv2.getTextSize(display_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)[0]
+        txt_ts = cv2.getTextSize(display_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)[0]
         cv2.putText(canvas, display_txt, (fx + 4, by + (bh + txt_ts[1]) // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (220, 220, 220), 1, cv2.LINE_AA)
         # Store field geometry for mouse click detection
         app["_jmp_field_rect"] = (fx, by, fx + jmp_field_w, by + bh)
 
@@ -732,7 +733,7 @@ def render(state: AnnotationState, cur_idx: int, total: int, is_done: bool = Fal
     cir_str = f"  |  CIR: {cir:.0%}" if cir < 1.0 else ""
     info = f"{name}{modified}{done_mark}  |  {cur_idx + 1}/{total}  |  Boxes: {len(state.annotations)}{iou_str}{cir_str}  |  {zoom_pct}%"
     info_col = (80, 210, 80) if is_done else (200, 200, 200)
-    cv2.putText(canvas, info, (8, bar_y + 24),
+    cv2.putText(canvas, info, (8, bar_y + 18),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, info_col, 1, cv2.LINE_AA)
 
     # Green DONE overlay on the left panel
@@ -774,15 +775,40 @@ def render(state: AnnotationState, cur_idx: int, total: int, is_done: bool = Fal
 
     hint = "A/D prev/next  S save  R reset  Ctrl+Scroll zoom  RightDrag pan  Ctrl+RightClick hide  Q quit"
     ts = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)[0]
-    cv2.putText(canvas, hint, (w - ts[0] - 8, bar_y + 24),
+    cv2.putText(canvas, hint, (w - ts[0] - 8, bar_y + 44),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (120, 120, 120), 1, cv2.LINE_AA)
+
+    # Global fish-done counter (bottom-left, second row)
+    if app is not None:
+        gfd = app.get("global_fish_done")
+        if gfd is not None:
+            gfd_str = f"Fish done: {gfd:,}"
+            cv2.putText(canvas, gfd_str, (8, bar_y + 44),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80, 210, 80), 1, cv2.LINE_AA)
 
     # ── elapsed time overlay (top-left corner) ─────────────────────────────
     elapsed = time.time() - state.load_time
     mins, secs = divmod(int(elapsed), 60)
-    time_str = f"{mins}:{secs:02d}"
+    time_str = f"IMG  {mins}:{secs:02d}"
+    total_elapsed = state.session_elapsed + elapsed
+    tmins, tsecs = divmod(int(total_elapsed), 60)
+    thours, tmins = divmod(tmins, 60)
+    tot_str = (f"TOT  {thours}:{tmins:02d}:{tsecs:02d}" if thours
+               else f"TOT  {tmins}:{tsecs:02d}")
     cv2.putText(canvas, time_str, (8, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.putText(canvas, tot_str, (8, 42),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (140, 180, 220), 1, cv2.LINE_AA)
+
+    # ── remaining center-points countdown (top-right of right panel) ──────
+    if app is not None:
+        rem = app.get("remaining_points")
+        if rem is not None:
+            rem_str = f"Remaining: {rem:,} pts"
+            rem_col = (80, 255, 80) if rem == 0 else (200, 200, 200)
+            rts = cv2.getTextSize(rem_str, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[0]
+            cv2.putText(canvas, rem_str, (w - rts[0] - 8, 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, rem_col, 1, cv2.LINE_AA)
 
     return canvas
 
@@ -1023,6 +1049,10 @@ def load_image(state: AnnotationState, img_id: str,
     if state.dirty:
         state.save()
 
+    # Accumulate time spent on the previous image
+    if state.img_path is not None:
+        state.session_elapsed += time.time() - state.load_time
+
     _img_dir = img_source_dir if img_source_dir is not None else (BASE_DIR / "images" / "unannotated")
     _xml_dir = xml_source_dir if xml_source_dir is not None else XML_DIR
     img_path   = _img_dir / f"{img_id}.jpg"
@@ -1184,7 +1214,7 @@ def _fix_bboxes_to_centers(xml_files: list[Path], win: str, win_w: int, win_h: i
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
-         fix_bboxes: bool = False) -> None:
+         fix_bboxes: bool = False, count_points: bool = False) -> None:
     _xml_dir = xml_source_dir if xml_source_dir is not None else XML_DIR
     xml_files_raw = sorted(_xml_dir.glob("*.xml"))
     if not xml_files_raw:
@@ -1193,7 +1223,8 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
 
     state = AnnotationState()
     cur = 0
-    app = {"nav": 0, "toggle_done": False, "jump_text": "", "jump_active": False}
+    app = {"nav": 0, "toggle_done": False, "jump_text": "", "jump_active": False,
+           "global_fish_done": 0}
 
     win = "Manual Bbox Annotation"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -1249,6 +1280,24 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
     image_ids = [f.stem for f in xml_files]
     total = len(image_ids)
     print(f"Found {total} annotated images ({len(done_files)} done, {len(notdone_files)} not done)")
+
+    # ── global fish-done counter (always, uses scan_results already available) ──
+    app["global_fish_done"] = sum(count for _, count in done_files)
+
+    # ── count total center points in not-done images (--countpoints) ───────
+    if count_points and notdone_files:
+        count_start = time.time()
+        _show_splash(win, state.win_w, state.win_h, "Counting points...", 0)
+        total_notdone_points = 0
+        for i, (_, cnt, _, _) in enumerate(notdone_files):
+            total_notdone_points += cnt
+            if i % 100 == 0 or i == len(notdone_files) - 1:
+                _show_splash(win, state.win_w, state.win_h,
+                             f"Counting points... {i + 1}/{len(notdone_files)}",
+                             time.time() - count_start)
+        app["remaining_points"] = total_notdone_points
+        print(f"Total center points in not-done images: {total_notdone_points:,}")
+
     if notdone_files:
         top = notdone_files[:min(5, len(notdone_files))]
         print("Top not-done by AvgIoU (desc):")
@@ -1300,12 +1349,19 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
         if app["toggle_done"]:
             app["toggle_done"] = False
             cur_id = image_ids[cur]
+            cur_count = len(state.annotations)
             if cur_id in done_ids:
                 done_ids.discard(cur_id)
                 set_done_in_xml(state.xml_path, False)
+                if "remaining_points" in app:
+                    app["remaining_points"] += cur_count
+                app["global_fish_done"] -= cur_count
             else:
                 done_ids.add(cur_id)
                 set_done_in_xml(state.xml_path, True)
+                if "remaining_points" in app:
+                    app["remaining_points"] -= cur_count
+                app["global_fish_done"] += cur_count
             # Update jump_text default to latest last-done position
             ld = next(
                 (i for i in range(len(image_ids) - 1, -1, -1) if image_ids[i] in done_ids),
@@ -1415,9 +1471,11 @@ def donesearch() -> None:
 
 if __name__ == "__main__":
     _fix_flag = "--fixbboxestocenters" in sys.argv
+    _count_flag = "--countpoints" in sys.argv
     if "--donesearch" in sys.argv:
         donesearch()
     elif "--showdone" in sys.argv:
-        main(xml_source_dir=DONE_DIR, img_source_dir=DONE_DIR, fix_bboxes=_fix_flag)
+        main(xml_source_dir=DONE_DIR, img_source_dir=DONE_DIR, fix_bboxes=_fix_flag,
+             count_points=_count_flag)
     else:
-        main(fix_bboxes=_fix_flag)
+        main(fix_bboxes=_fix_flag, count_points=_count_flag)
