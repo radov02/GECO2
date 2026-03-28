@@ -27,9 +27,6 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-# Ensure physical pixel coordinates on high-DPI displays
-ctypes.windll.user32.SetProcessDPIAware()
-
 # ── paths ──────────────────────────────────────────────────────────────────────
 BASE_DIR  = Path(__file__).resolve().parent
 IMG_DIR   = BASE_DIR / "images2"
