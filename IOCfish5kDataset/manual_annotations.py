@@ -18,6 +18,7 @@ Controls
 
 import cv2
 import re
+import json
 import numpy as np
 import xml.etree.ElementTree as ET
 import ctypes
@@ -33,6 +34,8 @@ IMG_DIR   = BASE_DIR / "images2"
 DEPTH_DIR = BASE_DIR.parent / "IOCfish5k-DDataset" / "color"
 XML_DIR   = IMG_DIR / "xml"
 DONE_DIR  = BASE_DIR / "done"
+TIME_FILE = BASE_DIR / ".annotation_time.json"
+IDLE_TIMEOUT = 8.0  # seconds of mouse inactivity before timers pause
 
 # ── visual settings ────────────────────────────────────────────────────────────
 BBOX_COLOR     = (0, 255, 0)       # green – untouched boxes
@@ -59,6 +62,19 @@ def _is_ctrl_pressed():
 
 def _is_shift_pressed():
     return bool(ctypes.windll.user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
+
+
+# ── Persistent time helpers ────────────────────────────────────────────────────
+
+def _load_total_time() -> float:
+    try:
+        data = json.loads(TIME_FILE.read_text(encoding="utf-8"))
+        return float(data.get("total_seconds", 0.0))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return 0.0
+
+def _save_total_time(seconds: float) -> None:
+    TIME_FILE.write_text(json.dumps({"total_seconds": seconds}), encoding="utf-8")
 
 
 # ── XML helpers ────────────────────────────────────────────────────────────────
@@ -337,6 +353,10 @@ class AnnotationState:
         self.hover_idx = -1  # index of bbox under cursor
         self.load_time = time.time()  # timestamp when image was loaded
         self.session_elapsed: float = 0.0  # accumulated time across all images
+        self.last_mouse_time: float = time.time()  # last mouse activity
+        self.idle: bool = False  # whether mouse is currently idle
+        self.idle_start: float = 0.0  # when idle started (to subtract from elapsed)
+        self.persistent_time: float = _load_total_time()  # loaded from disk
 
         # Pan interaction
         self.panning = False
@@ -504,7 +524,7 @@ def render(state: AnnotationState, cur_idx: int, total: int, is_done: bool = Fal
     pw, ph = state.panel_w, state.panel_h
 
     # ── left panel (annotated image) ───────────────────────────────────────
-    if state.img_left is not None:
+    if state.img_left is not None and pw > 0 and ph > 0:
         left = cv2.warpAffine(state.img_left, M, (pw, ph),
                               flags=cv2.INTER_LINEAR,
                               borderMode=cv2.BORDER_CONSTANT,
@@ -514,7 +534,7 @@ def render(state: AnnotationState, cur_idx: int, total: int, is_done: bool = Fal
     # ── right panel (depth colour) ─────────────────────────────────────────
     rx = pw + state.gap
     rw = w - rx
-    if state.img_right is not None and rw > 0:
+    if state.img_right is not None and rw > 0 and ph > 0:
         right = cv2.warpAffine(state.img_right, M, (rw, ph),
                                flags=cv2.INTER_LINEAR,
                                borderMode=cv2.BORDER_CONSTANT,
@@ -784,14 +804,21 @@ def render(state: AnnotationState, cur_idx: int, total: int, is_done: bool = Fal
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80, 210, 80), 1, cv2.LINE_AA)
 
     # ── elapsed time overlay (top-left corner) ─────────────────────────────
-    elapsed = time.time() - state.load_time
+    # If idle, freeze the image timer at when idle started
+    if state.idle:
+        elapsed = state.idle_start - state.load_time
+    else:
+        elapsed = time.time() - state.load_time
     mins, secs = divmod(int(elapsed), 60)
     time_str = f"IMG  {mins}:{secs:02d}"
-    total_elapsed = state.session_elapsed + elapsed
+    total_elapsed = state.persistent_time + state.session_elapsed + elapsed
     tmins, tsecs = divmod(int(total_elapsed), 60)
     thours, tmins = divmod(tmins, 60)
     tot_str = (f"TOT  {thours}:{tmins:02d}:{tsecs:02d}" if thours
                else f"TOT  {tmins}:{tsecs:02d}")
+    if state.idle:
+        time_str += "  [IDLE]"
+        tot_str += "  [IDLE]"
     cv2.putText(canvas, time_str, (8, 22),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.52, (180, 180, 180), 1, cv2.LINE_AA)
     cv2.putText(canvas, tot_str, (8, 42),
@@ -839,6 +866,15 @@ def _handle_zoom(state: AnnotationState, x: int, y: int, delta: int) -> None:
 
 def on_mouse(event: int, x: int, y: int, flags: int, param):
     state, app = param
+
+    # ── Update idle tracker on any mouse event ─────────────────────────────
+    now = time.time()
+    if state.idle:
+        # Waking up from idle – subtract idle duration from load_time
+        idle_dur = now - state.idle_start
+        state.load_time += idle_dur
+        state.idle = False
+    state.last_mouse_time = now
 
     # ── Scroll zoom (Ctrl + wheel) ─────────────────────────────────────────
     if event == cv2.EVENT_MOUSEWHEEL:
@@ -968,6 +1004,7 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
                     state.dirty = True
                     state.save()
                 else:
+                    # HANDLE_MOVE (interior) or edge/corner handle: start drag
                     state.dragging = True
                     state.drag_idx = idx
                     state.drag_handle = handle
@@ -995,7 +1032,6 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
             nx = int(max(0, min(iw - bw, o[0] + dix)))
             ny = int(max(0, min(ih - bh, o[1] + diy)))
             ann["bbox"] = [nx, ny, nx + bw, ny + bh]
-            # center point stays fixed – only bbox position changes
         else:
             nb = list(o)
             ht = state.drag_handle
@@ -1041,19 +1077,24 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
 
 def load_image(state: AnnotationState, img_id: str,
                img_source_dir: Path | None = None,
-               xml_source_dir: Path | None = None) -> None:
+               xml_source_dir: Path | None = None,
+               depth_source_dir: Path | None = None) -> None:
     """Load an image pair + its annotations into *state*."""
     if state.dirty:
         state.save()
 
-    # Accumulate time spent on the previous image
+    # Accumulate time spent on the previous image (excluding idle)
     if state.img_path is not None:
-        state.session_elapsed += time.time() - state.load_time
+        if state.idle:
+            state.session_elapsed += state.idle_start - state.load_time
+        else:
+            state.session_elapsed += time.time() - state.load_time
 
     _img_dir = img_source_dir if img_source_dir is not None else (BASE_DIR / "images" / "unannotated")
     _xml_dir = xml_source_dir if xml_source_dir is not None else XML_DIR
+    _depth_dir = depth_source_dir if depth_source_dir is not None else DEPTH_DIR
     img_path   = _img_dir / f"{img_id}.jpg"
-    depth_path = DEPTH_DIR / f"{img_id}.jpg"
+    depth_path = _depth_dir / f"{img_id}.jpg"
     xml_path   = _xml_dir / f"{img_id}.xml"
 
     state.img_path = img_path
@@ -1067,6 +1108,8 @@ def load_image(state: AnnotationState, img_id: str,
     state.hidden_stack = []
     state.hover_idx = -1
     state.load_time = time.time()
+    state.last_mouse_time = time.time()
+    state.idle = False
 
     # Left image
     if img_path.exists():
@@ -1211,6 +1254,7 @@ def _fix_bboxes_to_centers(xml_files: list[Path], win: str, win_w: int, win_h: i
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
+         depth_source_dir: Path | None = None,
          fix_bboxes: bool = False, count_points: bool = False) -> None:
     _xml_dir = xml_source_dir if xml_source_dir is not None else XML_DIR
     xml_files_raw = sorted(_xml_dir.glob("*.xml"))
@@ -1224,7 +1268,7 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
            "global_fish_done": 0}
 
     win = "Manual Bbox Annotation"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, state.win_w, state.win_h)
 
     # ── Fix bboxes to centers (if requested) ───────────────────────────────
@@ -1311,7 +1355,7 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
 
     cv2.setMouseCallback(win, on_mouse, (state, app))
 
-    load_image(state, image_ids[cur], img_source_dir=img_source_dir, xml_source_dir=xml_source_dir)
+    load_image(state, image_ids[cur], img_source_dir=img_source_dir, xml_source_dir=xml_source_dir, depth_source_dir=depth_source_dir)
 
     while True:
         # ── detect window close (X button) ─────────────────────────────────
@@ -1340,7 +1384,7 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
             app["nav"] = 0
             if 0 <= new_cur < total:
                 cur = new_cur
-                load_image(state, image_ids[cur], img_source_dir=img_source_dir, xml_source_dir=xml_source_dir)
+                load_image(state, image_ids[cur], img_source_dir=img_source_dir, xml_source_dir=xml_source_dir, depth_source_dir=depth_source_dir)
 
         # ── handle Done toggle ─────────────────────────────────────────────
         if app["toggle_done"]:
@@ -1386,7 +1430,7 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
                     target = int(app["jump_text"]) - 1  # 1-based → 0-based
                     if 0 <= target < total:
                         cur = target
-                        load_image(state, image_ids[cur], img_source_dir=img_source_dir, xml_source_dir=xml_source_dir)
+                        load_image(state, image_ids[cur], img_source_dir=img_source_dir, xml_source_dir=xml_source_dir, depth_source_dir=depth_source_dir)
                 except ValueError:
                     pass
                 app["jump_active"] = False
@@ -1409,12 +1453,12 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
         elif key in (ord("d"), ord("D"), KEY_RIGHT):  # next
             if cur < total - 1:
                 cur += 1
-                load_image(state, image_ids[cur], img_source_dir=img_source_dir, xml_source_dir=xml_source_dir)
+                load_image(state, image_ids[cur], img_source_dir=img_source_dir, xml_source_dir=xml_source_dir, depth_source_dir=depth_source_dir)
 
         elif key in (ord("a"), ord("A"), KEY_LEFT):   # prev
             if cur > 0:
                 cur -= 1
-                load_image(state, image_ids[cur], img_source_dir=img_source_dir, xml_source_dir=xml_source_dir)
+                load_image(state, image_ids[cur], img_source_dir=img_source_dir, xml_source_dir=xml_source_dir, depth_source_dir=depth_source_dir)
 
         elif key in (ord("s"), ord("S")):             # save
             state.save()
@@ -1428,6 +1472,14 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
         elif key in (ord("r"), ord("R")):             # reset zoom
             state.reset_view()
 
+    # ── Save persistent total time on exit ─────────────────────────────
+    if state.img_path is not None:
+        if state.idle:
+            state.session_elapsed += state.idle_start - state.load_time
+        else:
+            state.session_elapsed += time.time() - state.load_time
+    _save_total_time(state.persistent_time + state.session_elapsed)
+
     cv2.destroyAllWindows()
     print("Done.")
 
@@ -1435,7 +1487,7 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
 # ── Done-search CLI mode ──────────────────────────────────────────────────────
 
 def donesearch() -> None:
-    """Find all Done-flagged XMLs and copy them + their images to done/."""
+    """Find all Done-flagged XMLs and copy them + their images + depth-colour to done/."""
     done_dir = BASE_DIR / "done"
     done_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1451,26 +1503,138 @@ def donesearch() -> None:
             continue
         img_id = xml_path.stem
         img_path = BASE_DIR / "images" / "unannotated" / f"{img_id}.jpg"
+        depth_path = DEPTH_DIR / f"{img_id}.jpg"
 
         dst_xml = done_dir / xml_path.name
         shutil.copy2(xml_path, dst_xml)
 
+        parts = ["xml"]
         if img_path.exists():
-            dst_img = done_dir / img_path.name
-            shutil.copy2(img_path, dst_img)
-            print(f"  {img_id}: image + xml copied")
-        else:
-            print(f"  {img_id}: xml copied (image not found at {img_path})")
+            shutil.copy2(img_path, done_dir / img_path.name)
+            parts.append("image")
+        if depth_path.exists():
+            shutil.copy2(depth_path, done_dir / f"{img_id}_depth.jpg")
+            parts.append("depth")
+        print(f"  {img_id}: {' + '.join(parts)} copied")
         found += 1
 
     print(f"\nDone-search complete: {found} annotated image(s) copied to {done_dir}")
 
 
+# ── Divide CLI mode ───────────────────────────────────────────────────────────
+
+def divide(n: int, m: int | None = None) -> None:
+    """Copy undone images (sorted), their XMLs, and depth-colour images
+    into  IOCfish5kDataset/divided/<label>/  (images/, xml/, color/).
+
+    If *m* is None, take the first *n* items (folder name = n).
+    If *m* is given, take items from index *n* to *m* (1-based inclusive,
+    folder name = n_to_m).
+    """
+    _xml_dir = XML_DIR
+    xml_files_raw = sorted(_xml_dir.glob("*.xml"))
+    if not xml_files_raw:
+        print(f"No XML files found in {_xml_dir}")
+        return
+
+    # Parallel scan to find undone files (reuse existing helper)
+    print(f"Scanning {len(xml_files_raw)} XML files...")
+    with ThreadPoolExecutor() as pool:
+        scan_results = list(pool.map(_scan_xml, xml_files_raw))
+
+    # Filter to not-done, sort by avg_iou desc then center_ratio asc (same as main)
+    notdone = []
+    for f, (count, is_done, avg_iou, center_ratio) in zip(xml_files_raw, scan_results):
+        if not is_done:
+            notdone.append((f, count, avg_iou, center_ratio))
+    notdone.sort(key=lambda x: (-x[2], x[3]))
+
+    if m is not None:
+        # 1-based inclusive range → 0-based slice
+        selected = notdone[n - 1:m]
+        label = f"{n}_to_{m}"
+    else:
+        selected = notdone[:n]
+        label = str(n)
+
+    if not selected:
+        print("No undone images in the requested range.")
+        return
+
+    dst_root = BASE_DIR / "divided" / label
+    dst_img  = dst_root / "images"
+    dst_xml  = dst_root / "xml"
+    dst_clr  = dst_root / "color"
+    dst_img.mkdir(parents=True, exist_ok=True)
+    dst_xml.mkdir(parents=True, exist_ok=True)
+    dst_clr.mkdir(parents=True, exist_ok=True)
+
+    img_src = BASE_DIR / "images" / "unannotated"
+    copied = 0
+    for xml_path, _cnt, _iou, _cir in selected:
+        img_id = xml_path.stem
+        # Copy XML
+        shutil.copy2(xml_path, dst_xml / xml_path.name)
+        # Copy image
+        src_img = img_src / f"{img_id}.jpg"
+        if src_img.exists():
+            shutil.copy2(src_img, dst_img / src_img.name)
+        # Copy depth-colour image
+        src_clr = DEPTH_DIR / f"{img_id}.jpg"
+        if src_clr.exists():
+            shutil.copy2(src_clr, dst_clr / src_clr.name)
+        copied += 1
+
+    print(f"Divided: copied {copied} undone image(s) to {dst_root}")
+
+
 if __name__ == "__main__":
     _fix_flag = "--fixbboxestocenters" in sys.argv
     _count_flag = "--countpoints" in sys.argv
-    if "--donesearch" in sys.argv:
+
+    # --divide N [M]
+    _divide_n = None
+    _divide_m = None
+    if "--divide" in sys.argv:
+        idx = sys.argv.index("--divide")
+        if idx + 1 < len(sys.argv):
+            try:
+                _divide_n = int(sys.argv[idx + 1])
+            except ValueError:
+                print("Error: --divide requires integer argument(s)")
+                sys.exit(1)
+            # Optional second argument M
+            if idx + 2 < len(sys.argv) and not sys.argv[idx + 2].startswith("--"):
+                try:
+                    _divide_m = int(sys.argv[idx + 2])
+                except ValueError:
+                    pass  # not a number, ignore – treat as single-arg mode
+        else:
+            print("Error: --divide requires at least one integer argument")
+            sys.exit(1)
+
+    # --usedivided Path/to/folder
+    _usedivided = None
+    if "--usedivided" in sys.argv:
+        idx = sys.argv.index("--usedivided")
+        if idx + 1 < len(sys.argv):
+            _usedivided = Path(sys.argv[idx + 1])
+            if not _usedivided.is_dir():
+                print(f"Error: --usedivided path does not exist: {_usedivided}")
+                sys.exit(1)
+        else:
+            print("Error: --usedivided requires a path argument")
+            sys.exit(1)
+
+    if _divide_n is not None:
+        divide(_divide_n, _divide_m)
+    elif "--donesearch" in sys.argv:
         donesearch()
+    elif _usedivided is not None:
+        main(xml_source_dir=_usedivided / "xml",
+             img_source_dir=_usedivided / "images",
+             depth_source_dir=_usedivided / "color",
+             fix_bboxes=_fix_flag, count_points=_count_flag)
     elif "--showdone" in sys.argv:
         main(xml_source_dir=DONE_DIR, img_source_dir=DONE_DIR, fix_bboxes=_fix_flag,
              count_points=_count_flag)
