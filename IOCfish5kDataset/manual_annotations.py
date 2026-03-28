@@ -1224,7 +1224,7 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
            "global_fish_done": 0}
 
     win = "Manual Bbox Annotation"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
     cv2.resizeWindow(win, state.win_w, state.win_h)
 
     # ── Fix bboxes to centers (if requested) ───────────────────────────────
