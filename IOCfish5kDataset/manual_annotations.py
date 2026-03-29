@@ -54,6 +54,7 @@ BUTTON_BAR_H   = 52
 # ── Arrow key codes (OpenCV waitKeyEx on Windows) ──────────────────────────────
 KEY_LEFT  = 2424832
 KEY_RIGHT = 2555904
+KEY_F11   = 0x7A0000  # VK_F11 << 16
 
 # ── Windows API for modifier key detection ─────────────────────────────────────
 VK_CONTROL = 0x11
@@ -804,7 +805,7 @@ def render(state: AnnotationState, cur_idx: int, total: int, is_done: bool = Fal
     if nhid:
         info += f"  |  Hidden: {nhid}"
 
-    hint = "A/D prev/next  S save  R reset  Ctrl+Scroll zoom  LeftDrag pan  RightClick bbox  Ctrl+LeftClick hide  Q quit"
+    hint = "A/D prev/next  S save  R reset  F/F11 fullscreen  Ctrl+Scroll zoom  LeftDrag pan  RightClick bbox  Ctrl+LeftClick hide  Q quit"
     ts = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)[0]
     cv2.putText(canvas, hint, (w - ts[0] - 8, bar_y + 44),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (120, 120, 120), 1, cv2.LINE_AA)
@@ -1285,7 +1286,9 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
            "global_fish_done": 0}
 
     win = "Manual Bbox Annotation"
-    cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
+    cv2.resizeWindow(win, state.win_w, state.win_h)
+    fullscreen = False
 
     # ── Fix bboxes to centers (if requested) ───────────────────────────────
     if fix_bboxes:
@@ -1383,8 +1386,16 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
         except cv2.error:
             break
 
-        # (window resize tracking not needed – WINDOW_AUTOSIZE keeps
-        #  the window locked to our canvas size, preventing OS-level panning)
+        # ── track window resize and update layout ─────────────────────────
+        try:
+            rect = cv2.getWindowImageRect(win)
+            new_w, new_h = rect[2], rect[3]
+            if new_w > 0 and new_h > 0 and (new_w != state.win_w or new_h != state.win_h):
+                state.win_w = new_w
+                state.win_h = new_h
+                state.compute_layout()
+        except cv2.error:
+            pass
 
         # ── handle button navigation ───────────────────────────────────────
         if app["nav"] != 0:
@@ -1479,6 +1490,13 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
 
         elif key in (ord("r"), ord("R")):             # reset zoom
             state.reset_view()
+
+        elif key in (ord("f"), ord("F"), KEY_F11):    # toggle fullscreen
+            fullscreen = not fullscreen
+            if fullscreen:
+                cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+            else:
+                cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
 
     # ── Save persistent total time on exit ─────────────────────────────
     if state.img_path is not None:
