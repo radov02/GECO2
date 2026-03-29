@@ -976,7 +976,7 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
         state.panning = False
         return
 
-    # ── Left-click: bbox interaction (both panels) ─────────────────────────
+    # ── Left-click: bbox interaction (both panels) ─────────────────────────-
     if event == cv2.EVENT_LBUTTONDOWN:
         state.panning = False  # cancel any pan stuck from a missed RBUTTONUP
         pw = state.panel_w
