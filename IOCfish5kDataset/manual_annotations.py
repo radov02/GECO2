@@ -339,9 +339,12 @@ class AnnotationState:
         self.pan_x = 0.0
         self.pan_y = 0.0
 
-        # Window layout
-        self.win_w = 1600
-        self.win_h = 900
+        # Window layout – capped to fit the screen
+        _user32 = ctypes.windll.user32
+        _scr_w = _user32.GetSystemMetrics(0)   # SM_CXSCREEN  (physical px)
+        _scr_h = _user32.GetSystemMetrics(1)   # SM_CYSCREEN  (physical px)
+        self.win_w = min(1600, _scr_w - 40)
+        self.win_h = min(900,  _scr_h - 100)   # room for title-bar + taskbar
         self.panel_w = 0
         self.panel_h = 0
         self.base_scale = 1.0
@@ -1284,25 +1287,7 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
            "global_fish_done": 0}
 
     win = "Manual Bbox Annotation"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
-    cv2.resizeWindow(win, state.win_w, state.win_h)
-
-    # ── Remove Win32 scrollbar styles to prevent OS-level drag-to-pan ──────
-    try:
-        _hwnd = ctypes.windll.user32.FindWindowW(None, win)
-        if _hwnd:
-            _GWL_STYLE = -16
-            _style = ctypes.windll.user32.GetWindowLongW(_hwnd, _GWL_STYLE)
-            _WS_HSCROLL = 0x00100000
-            _WS_VSCROLL = 0x00200000
-            _new_style = _style & ~_WS_HSCROLL & ~_WS_VSCROLL
-            if _new_style != _style:
-                ctypes.windll.user32.SetWindowLongW(_hwnd, _GWL_STYLE, _new_style)
-                # Apply style change without moving/resizing
-                _SWP = 0x0020 | 0x0002 | 0x0001 | 0x0004  # FRAMECHANGED|NOMOVE|NOSIZE|NOZORDER
-                ctypes.windll.user32.SetWindowPos(_hwnd, 0, 0, 0, 0, 0, _SWP)
-    except Exception:
-        pass
+    cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
 
     # ── Fix bboxes to centers (if requested) ───────────────────────────────
     if fix_bboxes:
@@ -1400,16 +1385,8 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
         except cv2.error:
             break
 
-        # ── track window resize → re-render at correct size ────────────────
-        try:
-            rect = cv2.getWindowImageRect(win)
-            nw, nh = rect[2], rect[3]
-            if nw > 0 and nh > 0 and (nw != state.win_w or nh != state.win_h):
-                state.win_w = nw
-                state.win_h = nh
-                state.compute_layout()
-        except cv2.error:
-            pass
+        # (window resize tracking not needed – WINDOW_AUTOSIZE keeps
+        #  the window locked to our canvas size, preventing OS-level panning)
 
         # ── handle button navigation ───────────────────────────────────────
         if app["nav"] != 0:
