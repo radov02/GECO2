@@ -961,9 +961,11 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
         state.pan_origin = (state.pan_x, state.pan_y)
         return
 
-    if event == cv2.EVENT_MOUSEMOVE and state.panning:
-        if not (flags & cv2.EVENT_FLAG_RBUTTON):
-            # Right button was released outside the window – self-heal stuck pan
+    if event == cv2.EVENT_MOUSEMOVE and state.panning and not state.dragging:
+        lbutton_held = bool(flags & cv2.EVENT_FLAG_LBUTTON)
+        rbutton_held = bool(flags & cv2.EVENT_FLAG_RBUTTON)
+        if lbutton_held or not rbutton_held:
+            # Left button active or right button released → stop panning
             state.panning = False
         else:
             es = state.eff_scale()
