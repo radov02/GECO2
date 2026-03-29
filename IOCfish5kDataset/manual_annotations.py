@@ -10,7 +10,9 @@ Controls
   D / Right / Next button    next image
   A / Left  / Prev button    previous image
   Ctrl + Scroll              zoom in/out (both panels)
-  Right-click drag           pan when zoomed in
+  Left-click drag            pan when zoomed in
+  Right-click                select / move / resize bounding boxes
+  Ctrl + Left-click          hide a bounding box
   R                          reset zoom to fit
   S                          save annotations
   Q / Escape / Window X      quit (auto-saves)
@@ -802,7 +804,7 @@ def render(state: AnnotationState, cur_idx: int, total: int, is_done: bool = Fal
     if nhid:
         info += f"  |  Hidden: {nhid}"
 
-    hint = "A/D prev/next  S save  R reset  Ctrl+Scroll zoom  RightDrag pan  Ctrl+RightClick hide  Q quit"
+    hint = "A/D prev/next  S save  R reset  Ctrl+Scroll zoom  LeftDrag pan  RightClick bbox  Ctrl+LeftClick hide  Q quit"
     ts = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)[0]
     cv2.putText(canvas, hint, (w - ts[0] - 8, bar_y + 44),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (120, 120, 120), 1, cv2.LINE_AA)
@@ -947,27 +949,26 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
             app["toggle_done"] = True
         return
 
-    # ── Ctrl + Right-click: toggle bbox visibility ─────────────────────────
-    if event == cv2.EVENT_RBUTTONDOWN and _is_ctrl_pressed():
+    # ── Ctrl + Left-click: toggle bbox visibility ───────────────────────────
+    if event == cv2.EVENT_LBUTTONDOWN and _is_ctrl_pressed() and y < state.panel_h:
         pw = state.panel_w
         rx = pw + state.gap
-        if y < state.panel_h:
-            if x < pw:
-                hit_x = x
-                idx, _ = state.hit_test(hit_x, y, right_panel=False, for_hide=True)
-            elif x >= rx:
-                hit_x = x - rx
-                idx, _ = state.hit_test(hit_x, y, right_panel=True, for_hide=True)
-            else:
-                idx = -1
-            if idx >= 0:
-                state.hidden.add(idx)
-                state.hidden_stack.append(idx)
-                state.selected_idx = -1
+        if x < pw:
+            hit_x = x
+            idx, _ = state.hit_test(hit_x, y, right_panel=False, for_hide=True)
+        elif x >= rx:
+            hit_x = x - rx
+            idx, _ = state.hit_test(hit_x, y, right_panel=True, for_hide=True)
+        else:
+            idx = -1
+        if idx >= 0:
+            state.hidden.add(idx)
+            state.hidden_stack.append(idx)
+            state.selected_idx = -1
         return
 
-    # ── Right-click pan ────────────────────────────────────────────────────
-    if event == cv2.EVENT_RBUTTONDOWN:
+    # ── Left-click pan (image area only) ───────────────────────────────────
+    if event == cv2.EVENT_LBUTTONDOWN and y < state.panel_h:
         state.panning = True
         state.pan_start = (x, y)
         state.pan_origin = (state.pan_x, state.pan_y)
@@ -975,9 +976,7 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
 
     if event == cv2.EVENT_MOUSEMOVE and state.panning and not state.dragging:
         lbutton_held = bool(flags & cv2.EVENT_FLAG_LBUTTON)
-        rbutton_held = bool(flags & cv2.EVENT_FLAG_RBUTTON)
-        if lbutton_held or not rbutton_held:
-            # Left button active or right button released → stop panning
+        if not lbutton_held:
             state.panning = False
         else:
             es = state.eff_scale()
@@ -986,22 +985,20 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
                 state.pan_y = state.pan_origin[1] - (y - state.pan_start[1]) / es
             return
 
-    if event == cv2.EVENT_RBUTTONUP:
-        state.panning = False
+    if event == cv2.EVENT_LBUTTONUP:
+        if state.panning:
+            state.panning = False
         return
 
-    # ── Left-click: bbox interaction (both panels) ─────────────────────────-
-    if event == cv2.EVENT_LBUTTONDOWN:
-        state.panning = False  # cancel any pan stuck from a missed RBUTTONUP
+    # ── Right-click: bbox interaction (both panels) ────────────────────────
+    if event == cv2.EVENT_RBUTTONDOWN:
         pw = state.panel_w
         rx = pw + state.gap
         if y < state.panel_h:
             if x < pw:
-                # Left panel – all bboxes
                 hit_x = x
                 idx, handle = state.hit_test(hit_x, y, right_panel=False)
             elif x >= rx:
-                # Right panel – only moved/selected bboxes
                 hit_x = x - rx
                 idx, handle = state.hit_test(hit_x, y, right_panel=True)
             else:
@@ -1010,7 +1007,6 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
             if idx >= 0:
                 ann = state.annotations[idx]
                 if handle == HANDLE_CREATE:
-                    # Generate default bbox around the center point
                     cx, cy = ann["center"]
                     ih, iw = state.img_shape[:2]
                     h = DEFAULT_BBOX_HALF
@@ -1023,7 +1019,6 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
                     state.dirty = True
                     state.save()
                 else:
-                    # HANDLE_MOVE (interior) or edge/corner handle: start drag
                     state.dragging = True
                     state.drag_idx = idx
                     state.drag_handle = handle
@@ -1033,8 +1028,9 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
                     state.selected_idx = idx
             else:
                 state.selected_idx = -1
+        return
 
-    elif event == cv2.EVENT_MOUSEMOVE and state.dragging:
+    if event == cv2.EVENT_MOUSEMOVE and state.dragging:
         es = state.eff_scale()
         if es <= 0:
             return
@@ -1065,15 +1061,17 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
             ann["bbox"] = nb
 
         state.dirty = True
+        return
 
-    elif event == cv2.EVENT_LBUTTONUP:
+    if event == cv2.EVENT_RBUTTONUP:
         if state.dragging:
             state.moved.add(state.drag_idx)
             state.dragging = False
             if state.dirty:
                 state.save()
+        return
 
-    # ── Hover detection (passive MOUSEMOVE) ────────────────────────────────────────
+    # ── Hover detection (passive MOUSEMOVE) ────────────────────────────────
     if event == cv2.EVENT_MOUSEMOVE and not state.dragging and not state.panning:
         pw = state.panel_w
         rx = pw + state.gap
