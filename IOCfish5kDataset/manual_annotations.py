@@ -962,11 +962,15 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
         return
 
     if event == cv2.EVENT_MOUSEMOVE and state.panning:
-        es = state.eff_scale()
-        if es > 0:
-            state.pan_x = state.pan_origin[0] - (x - state.pan_start[0]) / es
-            state.pan_y = state.pan_origin[1] - (y - state.pan_start[1]) / es
-        return
+        if not (flags & cv2.EVENT_FLAG_RBUTTON):
+            # Right button was released outside the window – self-heal stuck pan
+            state.panning = False
+        else:
+            es = state.eff_scale()
+            if es > 0:
+                state.pan_x = state.pan_origin[0] - (x - state.pan_start[0]) / es
+                state.pan_y = state.pan_origin[1] - (y - state.pan_start[1]) / es
+            return
 
     if event == cv2.EVENT_RBUTTONUP:
         state.panning = False
@@ -974,6 +978,7 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
 
     # ── Left-click: bbox interaction (both panels) ─────────────────────────
     if event == cv2.EVENT_LBUTTONDOWN:
+        state.panning = False  # cancel any pan stuck from a missed RBUTTONUP
         pw = state.panel_w
         rx = pw + state.gap
         if y < state.panel_h:
