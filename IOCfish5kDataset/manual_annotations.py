@@ -63,6 +63,15 @@ def _is_ctrl_pressed():
 def _is_shift_pressed():
     return bool(ctypes.windll.user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
 
+# ── DPI awareness (must be called before any window creation) ──────────────────
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)   # PROCESS_SYSTEM_DPI_AWARE
+except (AttributeError, OSError):
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except (AttributeError, OSError):
+        pass
+
 
 # ── Persistent time helpers ────────────────────────────────────────────────────
 
@@ -1277,6 +1286,23 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
     win = "Manual Bbox Annotation"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
     cv2.resizeWindow(win, state.win_w, state.win_h)
+
+    # ── Remove Win32 scrollbar styles to prevent OS-level drag-to-pan ──────
+    try:
+        _hwnd = ctypes.windll.user32.FindWindowW(None, win)
+        if _hwnd:
+            _GWL_STYLE = -16
+            _style = ctypes.windll.user32.GetWindowLongW(_hwnd, _GWL_STYLE)
+            _WS_HSCROLL = 0x00100000
+            _WS_VSCROLL = 0x00200000
+            _new_style = _style & ~_WS_HSCROLL & ~_WS_VSCROLL
+            if _new_style != _style:
+                ctypes.windll.user32.SetWindowLongW(_hwnd, _GWL_STYLE, _new_style)
+                # Apply style change without moving/resizing
+                _SWP = 0x0020 | 0x0002 | 0x0001 | 0x0004  # FRAMECHANGED|NOMOVE|NOSIZE|NOZORDER
+                ctypes.windll.user32.SetWindowPos(_hwnd, 0, 0, 0, 0, 0, _SWP)
+    except Exception:
+        pass
 
     # ── Fix bboxes to centers (if requested) ───────────────────────────────
     if fix_bboxes:
