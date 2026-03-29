@@ -961,17 +961,6 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
         state.pan_origin = (state.pan_x, state.pan_y)
         return
 
-    if event == cv2.EVENT_MOUSEMOVE and state.panning:
-        if not (flags & cv2.EVENT_FLAG_RBUTTON):
-            # Right button was released outside the window – self-heal stuck pan
-            state.panning = False
-        else:
-            es = state.eff_scale()
-            if es > 0:
-                state.pan_x = state.pan_origin[0] - (x - state.pan_start[0]) / es
-                state.pan_y = state.pan_origin[1] - (y - state.pan_start[1]) / es
-            return
-
     if event == cv2.EVENT_RBUTTONUP:
         state.panning = False
         return
@@ -1019,48 +1008,67 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
                     state.selected_idx = idx
             else:
                 state.selected_idx = -1
+        return
 
-    elif event == cv2.EVENT_MOUSEMOVE and state.dragging:
-        es = state.eff_scale()
-        if es <= 0:
-            return
-        dix = (x - state.drag_start[0]) / es
-        diy = (y - state.drag_start[1]) / es
-
-        ann = state.annotations[state.drag_idx]
-        o = state.drag_bbox_start
-        ih, iw = state.img_shape[:2]
-
-        if state.drag_handle == HANDLE_MOVE:
-            bw = o[2] - o[0]
-            bh = o[3] - o[1]
-            nx = int(max(0, min(iw - bw, o[0] + dix)))
-            ny = int(max(0, min(ih - bh, o[1] + diy)))
-            ann["bbox"] = [nx, ny, nx + bw, ny + bh]
-        else:
-            nb = list(o)
-            ht = state.drag_handle
-            if ht in (HANDLE_TL, HANDLE_L, HANDLE_BL):
-                nb[0] = int(max(0, min(o[2] - 5, o[0] + dix)))
-            if ht in (HANDLE_TR, HANDLE_R, HANDLE_BR):
-                nb[2] = int(max(o[0] + 5, min(iw, o[2] + dix)))
-            if ht in (HANDLE_TL, HANDLE_T, HANDLE_TR):
-                nb[1] = int(max(0, min(o[3] - 5, o[1] + diy)))
-            if ht in (HANDLE_BL, HANDLE_B, HANDLE_BR):
-                nb[3] = int(max(o[1] + 5, min(ih, o[3] + diy)))
-            ann["bbox"] = nb
-
-        state.dirty = True
-
-    elif event == cv2.EVENT_LBUTTONUP:
+    if event == cv2.EVENT_LBUTTONUP:
         if state.dragging:
             state.moved.add(state.drag_idx)
             state.dragging = False
             if state.dirty:
                 state.save()
+        return
 
-    # ── Hover detection (passive MOUSEMOVE) ────────────────────────────────────────
-    if event == cv2.EVENT_MOUSEMOVE and not state.dragging and not state.panning:
+    # ── MOUSEMOVE: bbox drag ALWAYS wins over pan ──────────────────────────
+    if event == cv2.EVENT_MOUSEMOVE:
+        # 1) Active left-button bbox drag has absolute priority
+        if state.dragging:
+            es = state.eff_scale()
+            if es <= 0:
+                return
+            dix = (x - state.drag_start[0]) / es
+            diy = (y - state.drag_start[1]) / es
+
+            ann = state.annotations[state.drag_idx]
+            o = state.drag_bbox_start
+            ih, iw = state.img_shape[:2]
+
+            if state.drag_handle == HANDLE_MOVE:
+                bw = o[2] - o[0]
+                bh = o[3] - o[1]
+                nx = int(max(0, min(iw - bw, o[0] + dix)))
+                ny = int(max(0, min(ih - bh, o[1] + diy)))
+                ann["bbox"] = [nx, ny, nx + bw, ny + bh]
+            else:
+                nb = list(o)
+                ht = state.drag_handle
+                if ht in (HANDLE_TL, HANDLE_L, HANDLE_BL):
+                    nb[0] = int(max(0, min(o[2] - 5, o[0] + dix)))
+                if ht in (HANDLE_TR, HANDLE_R, HANDLE_BR):
+                    nb[2] = int(max(o[0] + 5, min(iw, o[2] + dix)))
+                if ht in (HANDLE_TL, HANDLE_T, HANDLE_TR):
+                    nb[1] = int(max(0, min(o[3] - 5, o[1] + diy)))
+                if ht in (HANDLE_BL, HANDLE_B, HANDLE_BR):
+                    nb[3] = int(max(o[1] + 5, min(ih, o[3] + diy)))
+                ann["bbox"] = nb
+
+            state.dirty = True
+            return
+
+        # 2) Right-button pan (only when left button is NOT held)
+        if state.panning:
+            rbutton_held = bool(flags & cv2.EVENT_FLAG_RBUTTON)
+            lbutton_held = bool(flags & cv2.EVENT_FLAG_LBUTTON)
+            if rbutton_held and not lbutton_held:
+                es = state.eff_scale()
+                if es > 0:
+                    state.pan_x = state.pan_origin[0] - (x - state.pan_start[0]) / es
+                    state.pan_y = state.pan_origin[1] - (y - state.pan_start[1]) / es
+                return
+            else:
+                # Right button released outside window, or left held → stop pan
+                state.panning = False
+
+        # 3) Passive hover detection
         pw = state.panel_w
         rx = pw + state.gap
         if y < state.panel_h:
