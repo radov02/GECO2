@@ -9,15 +9,13 @@ import sys
 _this_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(_this_dir / 'Deformable-DETR' / 'models' / 'ops'))
 
+import cv2
 import numpy as np
 import torch
 from torch.nn import DataParallel
 from torch.utils.data import DataLoader
 from torchvision import ops
 from tqdm import tqdm
-from torchvision.utils import draw_bounding_boxes
-from torchvision.transforms.functional import to_pil_image
-from PIL import ImageDraw
 
 from models.counter_infer import build_model
 from models.matcher import build_matcher
@@ -130,37 +128,47 @@ def evaluate(args):
         # Save visualizations: predicted bboxes and centers (per image in batch)
         for idx in range(img.shape[0]):
             pred_boxes = pred_boxes_batch[idx]
-            if pred_boxes.numel() == 0:
+
+            # Load the original (unpadded, unnormalized) image from disk
+            img_id = test_dataset.image_ids[ids[idx].item()]
+            orig_img_path = str(test_dataset.data_path / f'{img_id}.jpg')
+            vis_img = cv2.imread(orig_img_path)
+            if vis_img is None:
                 continue
+            orig_h, orig_w = vis_img.shape[:2]
+            sf = scaling_factor[idx].item()
 
-            H = img.shape[-2]
-            W = img.shape[-1]
+            # Visual settings (matching bbox_annotations.py)
+            DOT_RADIUS = 4
+            DOT_COLOR = (0, 0, 255)       # red (BGR)
+            BBOX_COLOR = (0, 255, 0)       # green (BGR)
+            BBOX_THICKNESS = 2
+            TEXT_COLOR = (0, 255, 255)      # yellow (BGR)
 
-            # Convert boxes to (x1,y1,x2,y2) in pixel coords for drawing.
-            # The model returns boxes in a (y1,x1,y2,x2)-like normalized format,
-            # so convert to (x1,y1,x2,y2) by swapping indices: (x1 = box[1]*W, y1=box[0]*H, ...)
-            boxes = pred_boxes.clone()
-            boxes_xy = torch.stack([
-                boxes[:, 1] * W,
-                boxes[:, 0] * H,
-                boxes[:, 3] * W,
-                boxes[:, 2] * H,
-            ], dim=1)
+            if pred_boxes.numel() > 0:
+                # Boxes are normalised (x1,y1,x2,y2) in the 1024x1024 padded image.
+                # Convert back to original pixel coordinates.
+                img_sz = float(img.shape[-1])  # 1024
+                boxes_px = pred_boxes.clone() * img_sz / sf
 
-            img_vis = (img[idx].detach().cpu() * 255).clamp(0, 255).to(torch.uint8)
-            vis = draw_bounding_boxes(img_vis, boxes=boxes_xy, colors='red', width=2)
-            pil = to_pil_image(vis)
-            draw = ImageDraw.Draw(pil)
+                for b in boxes_px:
+                    x1, y1, x2, y2 = (
+                        int(b[0].clamp(0, orig_w)),
+                        int(b[1].clamp(0, orig_h)),
+                        int(b[2].clamp(0, orig_w)),
+                        int(b[3].clamp(0, orig_h)),
+                    )
+                    cv2.rectangle(vis_img, (x1, y1), (x2, y2), BBOX_COLOR, BBOX_THICKNESS)
+                    cx = (x1 + x2) // 2
+                    cy = (y1 + y2) // 2
+                    cv2.circle(vis_img, (cx, cy), DOT_RADIUS, DOT_COLOR, -1)
 
-            # Draw centers
-            for b in boxes_xy:
-                cx = float((b[0] + b[2]) / 2.0)
-                cy = float((b[1] + b[3]) / 2.0)
-                r = max(2, int(min(H, W) * 0.003))
-                draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill='yellow')
+            label = f"count: {num_objects_pred[idx]}"
+            cv2.putText(vis_img, label, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, TEXT_COLOR, 2)
 
-            out_name = os.path.join(visuals_dir, f"{ids[idx].item():08d}_pred.png")
-            pil.save(out_name)
+            out_name = os.path.join(visuals_dir, f"{img_id}_pred.png")
+            cv2.imwrite(out_name, vis_img)
 
     n = len(test_dataset)
     mae = ae.item() / n
