@@ -2,12 +2,22 @@ import argparse
 import os
 from pathlib import Path
 
+import sys
+# Ensure local Deformable-DETR ops (which provide a top-level `modules` package)
+# are on the import path so imports like `from modules.ms_deform_attn import ...`
+# resolve to the repo copy instead of a conflicting PyPI package named `modules`.
+_this_dir = Path(__file__).resolve().parent
+sys.path.insert(0, str(_this_dir / 'Deformable-DETR' / 'models' / 'ops'))
+
 import numpy as np
 import torch
 from torch.nn import DataParallel
 from torch.utils.data import DataLoader
 from torchvision import ops
 from tqdm import tqdm
+from torchvision.utils import draw_bounding_boxes
+from torchvision.transforms.functional import to_pil_image
+from PIL import ImageDraw
 
 from models.counter_infer import build_model
 from models.matcher import build_matcher
@@ -61,6 +71,9 @@ def evaluate(args):
         collate_fn=pad_collate_test,
     )
 
+    visuals_dir = os.path.join(args.model_path, f'{args.model_name}_visuals')
+    os.makedirs(visuals_dir, exist_ok=True)
+
     ae = torch.tensor(0.0).to(device)
     se = torch.tensor(0.0).to(device)
     per_image_results = []
@@ -73,11 +86,13 @@ def evaluate(args):
         outputs, ref_points, centerness, outputs_coord, masks = model(img, bboxes)
 
         num_objects_pred = []
+        pred_boxes_batch = []
         for idx in range(img.shape[0]):
             thr = 1 / 0.11
 
             if len(outputs[idx]['pred_boxes'][-1]) == 0:
                 num_objects_pred.append(0)
+                pred_boxes_batch.append(torch.empty((0, 4), device=device))
             else:
                 v = outputs[idx]["box_v"]
                 v_thr = v.max() / thr
@@ -97,6 +112,7 @@ def evaluate(args):
                 valid = (center[:, 0] * img.shape[-2] < maxw) & (center[:, 1] * img.shape[-1] < maxh)
                 boxes = boxes[valid]
                 num_objects_pred.append(len(boxes))
+                pred_boxes_batch.append(boxes.detach().cpu())
 
         num_objects_gt = density_map.flatten(1).sum(dim=1)
         num_objects_pred_t = torch.tensor(num_objects_pred, dtype=torch.float32)
@@ -110,6 +126,41 @@ def evaluate(args):
                 'gt_count': num_objects_gt[idx].item(),
                 'pred_count': num_objects_pred[idx],
             })
+
+        # Save visualizations: predicted bboxes and centers (per image in batch)
+        for idx in range(img.shape[0]):
+            pred_boxes = pred_boxes_batch[idx]
+            if pred_boxes.numel() == 0:
+                continue
+
+            H = img.shape[-2]
+            W = img.shape[-1]
+
+            # Convert boxes to (x1,y1,x2,y2) in pixel coords for drawing.
+            # The model returns boxes in a (y1,x1,y2,x2)-like normalized format,
+            # so convert to (x1,y1,x2,y2) by swapping indices: (x1 = box[1]*W, y1=box[0]*H, ...)
+            boxes = pred_boxes.clone()
+            boxes_xy = torch.stack([
+                boxes[:, 1] * W,
+                boxes[:, 0] * H,
+                boxes[:, 3] * W,
+                boxes[:, 2] * H,
+            ], dim=1)
+
+            img_vis = (img[idx].detach().cpu() * 255).clamp(0, 255).to(torch.uint8)
+            vis = draw_bounding_boxes(img_vis, boxes=boxes_xy, colors='red', width=2)
+            pil = to_pil_image(vis)
+            draw = ImageDraw.Draw(pil)
+
+            # Draw centers
+            for b in boxes_xy:
+                cx = float((b[0] + b[2]) / 2.0)
+                cy = float((b[1] + b[3]) / 2.0)
+                r = max(2, int(min(H, W) * 0.003))
+                draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill='yellow')
+
+            out_name = os.path.join(visuals_dir, f"{ids[idx].item():08d}_pred.png")
+            pil.save(out_name)
 
     n = len(test_dataset)
     mae = ae.item() / n

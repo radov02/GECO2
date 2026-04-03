@@ -104,9 +104,9 @@ cache/
 # ======================
 # IOCfish5k Dataset
 # ======================
-IOCfish5kDataset/annotations/**
+IOCfish5kDataset/point_annotations/**
 IOCfish5kDataset/images/**
-!IOCfish5kDataset/annotations/.gitkeep
+!IOCfish5kDataset/point_annotations/.gitkeep
 !IOCfish5kDataset/images/.gitkeep
 IOCfish5kDataset/images2/**
 !IOCfish5kDataset/images2/.gitkeep

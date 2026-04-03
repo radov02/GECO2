@@ -2,8 +2,8 @@
 Manual bounding-box annotation tool with zoom, pan, and precise editing.
 
 Shows two images side by side:
-  Left  – image from IOCfish5kDataset/images2 with interactive bounding boxes
-  Right – corresponding depth-colour image from IOCfish5k-DDataset/color
+  Left  - image from IOCfish5kDataset/images2 with interactive bounding boxes
+  Right - corresponding depth-colour image from IOCfish5k-DDataset/color
 
 Controls
 --------
@@ -40,9 +40,9 @@ TIME_FILE = BASE_DIR / ".annotation_time.json"
 IDLE_TIMEOUT = 8.0  # seconds of mouse inactivity before timers pause
 
 # ── visual settings ────────────────────────────────────────────────────────────
-BBOX_COLOR     = (0, 255, 0)       # green – untouched boxes
+BBOX_COLOR     = (0, 255, 0)       # green - untouched boxes
 BBOX_SEL_COLOR = (0, 255, 255)     # yellow for selected
-BBOX_MOVED_CLR = (255, 255, 255)   # white – already adjusted boxes
+BBOX_MOVED_CLR = (255, 255, 255)   # white - already adjusted boxes
 BBOX_THICKNESS = 1                 # thin for precision
 DOT_COLOR      = (0, 0, 255)       # red centre dot
 DOT_RADIUS     = 3                 # fixed display pixels
@@ -342,7 +342,7 @@ class AnnotationState:
         self.pan_x = 0.0
         self.pan_y = 0.0
 
-        # Window layout – capped to fit the screen
+        # Window layout - capped to fit the screen
         _user32 = ctypes.windll.user32
         _scr_w = _user32.GetSystemMetrics(0)   # SM_CXSCREEN  (physical px)
         _scr_h = _user32.GetSystemMetrics(1)   # SM_CYSCREEN  (physical px)
@@ -458,7 +458,7 @@ class AnnotationState:
                 if abs(ix - hx) < grab and abs(iy - hy) < grab:
                     return i, h_idx
 
-        # Selected box interior first (priority – it's rendered on top)
+        # Selected box interior first (priority - it's rendered on top)
         if 0 <= self.selected_idx < len(self.annotations) and _eligible(self.selected_idx):
             s_ann = self.annotations[self.selected_idx]
             if s_ann["bbox"] is not None:
@@ -466,7 +466,7 @@ class AnnotationState:
                 if sxmin <= ix <= sxmax and symin <= iy <= symax:
                     return self.selected_idx, HANDLE_MOVE
 
-        # Hovered box interior (priority – it's rendered above normal boxes)
+        # Hovered box interior (priority - it's rendered above normal boxes)
         if (0 <= self.hover_idx < len(self.annotations)
                 and self.hover_idx != self.selected_idx
                 and _eligible(self.hover_idx)):
@@ -614,7 +614,7 @@ def render(state: AnnotationState, cur_idx: int, total: int, is_done: bool = Fal
         if 0 <= dc[0] <= pw and 0 <= dc[1] <= ph:
             cv2.circle(canvas, dc, DOT_RADIUS, dot_col, -1, cv2.LINE_AA)
 
-        # Right panel – only moved / selected bboxes
+        # Right panel - only moved / selected bboxes
         if moved or selected:
             rp1 = (max(rx, p1[0] + rx), max(0, p1[1]))
             rp2 = (min(w, p2[0] + rx), min(ph, p2[1]))
@@ -635,13 +635,13 @@ def render(state: AnnotationState, cur_idx: int, total: int, is_done: bool = Fal
             for hx, hy in state._handles_for(i):
                 dh = state.img_to_disp(hx, hy)
                 r = HANDLE_RADIUS
-                # Left panel handle – clamp to panel
+                # Left panel handle - clamp to panel
                 if -r <= dh[0] <= pw + r and -r <= dh[1] <= ph + r:
                     hl1 = (max(0, dh[0] - r), max(0, dh[1] - r))
                     hl2 = (min(pw, dh[0] + r), min(ph, dh[1] + r))
                     cv2.rectangle(canvas, hl1, hl2, HANDLE_COLOR, -1)
                     cv2.rectangle(canvas, hl1, hl2, (0, 0, 0), 1)
-                # Right panel handle – clamp to panel
+                # Right panel handle - clamp to panel
                 rdh_x = dh[0] + rx
                 if rx - r <= rdh_x <= w + r and -r <= dh[1] <= ph + r:
                     hr1 = (max(rx, rdh_x - r), max(0, dh[1] - r))
@@ -777,11 +777,11 @@ def render(state: AnnotationState, cur_idx: int, total: int, is_done: bool = Fal
     overlay_y = 30
     if max_iou > 0 and not is_done:
         if max_iou >= 0.5:
-            iou_col = (0, 0, 255)     # red – heavy overlap
+            iou_col = (0, 0, 255)     # red - heavy overlap
         elif max_iou >= 0.2:
-            iou_col = (0, 165, 255)   # orange – moderate
+            iou_col = (0, 165, 255)   # orange - moderate
         else:
-            iou_col = (0, 200, 200)   # yellow – mild
+            iou_col = (0, 200, 200)   # yellow - mild
         iou_overlay = f"AvgIoU {max_iou:.2f}"
         ots = cv2.getTextSize(iou_overlay, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
         cv2.putText(canvas, iou_overlay, (pw - ots[0] - 8, overlay_y),
@@ -791,11 +791,11 @@ def render(state: AnnotationState, cur_idx: int, total: int, is_done: bool = Fal
     # Center-inside ratio overlay
     if cir < 1.0 and not is_done:
         if cir <= 0.5:
-            cir_col = (0, 0, 255)     # red – many outside
+            cir_col = (0, 0, 255)     # red - many outside
         elif cir <= 0.8:
-            cir_col = (0, 165, 255)   # orange – some outside
+            cir_col = (0, 165, 255)   # orange - some outside
         else:
-            cir_col = (0, 200, 200)   # yellow – few outside
+            cir_col = (0, 200, 200)   # yellow - few outside
         cir_overlay = f"CIR {cir:.0%}"
         cots = cv2.getTextSize(cir_overlay, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
         cv2.putText(canvas, cir_overlay, (pw - cots[0] - 8, overlay_y),
@@ -885,7 +885,7 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
     # ── Update idle tracker on any mouse event ─────────────────────────────
     now = time.time()
     if state.idle:
-        # Waking up from idle – subtract idle duration from load_time
+        # Waking up from idle - subtract idle duration from load_time
         idle_dur = now - state.idle_start
         state.load_time += idle_dur
         state.idle = False
@@ -1304,7 +1304,7 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
     sort_start = time.time()
     _show_splash(win, state.win_w, state.win_h, "Sorting...", 0)
 
-    # Parallel scan: one file read per XML – (count, is_done, avg_iou, center_ratio) in one pass
+    # Parallel scan: one file read per XML - (count, is_done, avg_iou, center_ratio) in one pass
     with ThreadPoolExecutor() as pool:
         futures = {pool.submit(_scan_xml, f): i for i, f in enumerate(xml_files_raw)}
         scan_results = [None] * len(xml_files_raw)
@@ -1437,14 +1437,14 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
 
         # ── jump field keyboard handling ───────────────────────────────────
         if app["jump_active"] and key != -1:
-            if key == 27:                             # Escape – deactivate
+            if key == 27:                             # Escape - deactivate
                 app["jump_active"] = False
                 ld = next(
                     (i for i in range(total - 1, -1, -1) if image_ids[i] in done_ids),
                     0,
                 )
                 app["jump_text"] = str(ld + 1)
-            elif key == 13:                           # Enter – jump
+            elif key == 13:                           # Enter - jump
                 try:
                     target = int(app["jump_text"]) - 1  # 1-based → 0-based
                     if 0 <= target < total:
@@ -1483,7 +1483,7 @@ def main(xml_source_dir: Path | None = None, img_source_dir: Path | None = None,
             state.save()
             print(f"Saved {state.xml_path.name}")
 
-        elif key == 26:                               # Ctrl+Z – unhide last
+        elif key == 26:                               # Ctrl+Z - unhide last
             if state.hidden_stack:
                 idx = state.hidden_stack.pop()
                 state.hidden.discard(idx)
@@ -1634,7 +1634,7 @@ if __name__ == "__main__":
                 try:
                     _divide_m = int(sys.argv[idx + 2])
                 except ValueError:
-                    pass  # not a number, ignore – treat as single-arg mode
+                    pass  # not a number, ignore - treat as single-arg mode
         else:
             print("Error: --divide requires at least one integer argument")
             sys.exit(1)

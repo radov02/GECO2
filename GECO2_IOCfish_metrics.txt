@@ -1,0 +1,9 @@
+Model path: /home/erik/GECO2/models/GECO2_IOCfish.pth
+Best epoch: 1
+Train loss: 3105.809
+Val loss:   251.817
+Train MAE:  8.568
+Val MAE:    1.814
+Val RMSE:   1.99
+Test MAE:   1.787
+Test RMSE:  1.90

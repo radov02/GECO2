@@ -12,7 +12,7 @@ from PIL import Image, ImageDraw, ImageFont
 # ── paths ──────────────────────────────────────────────────────────────────────
 BASE_DIR   = Path(__file__).parent
 IMG_DIR    = BASE_DIR / "images"
-ANN_DIR    = BASE_DIR / "annotations"
+ANN_DIR    = BASE_DIR / "point_annotations"
 OUT_DIR    = IMG_DIR  / "annotated"
 
 # ── visual settings ────────────────────────────────────────────────────────────
