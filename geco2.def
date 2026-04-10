@@ -1,0 +1,133 @@
+Bootstrap: docker
+From: nvidia/cuda:12.1.0-devel-ubuntu22.04
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GECO2 – Generalized-Scale Object Counting (AAAI 2026)
+# Run `apptainer build geco2.sif geco2.def` from inside the GECO2/ folder.
+# ─────────────────────────────────────────────────────────────────────────────
+
+%labels
+    Author GECO2
+    Version 1.0
+    Description GECO2 object-counting container for HPC (CUDA 12.1, PyTorch 2.1)
+
+%help
+    Build (run from GECO2/ directory, needs sudo or --fakeroot):
+        apptainer build geco2.sif geco2.def
+        # or without root:
+        apptainer build --fakeroot geco2.sif geco2.def
+
+    ── Inference on IOCfish test set ────────────────────────────────────────
+        apptainer exec --nv \
+            --bind /path/to/IOCfish_done:/opt/geco2/IOCfish5kDataset/done \
+            --bind /path/to/checkpoints:/opt/geco2/ckpts \
+            geco2.sif \
+            python3 /opt/geco2/inference_on_IOCfish_dataset.py \
+                --model_path /opt/geco2/ckpts \
+                --model_name GECO2_IOCfish
+
+        Outputs:
+          /opt/geco2/ckpts/GECO2_IOCfish_visuals/   ← annotated PNG images
+          /opt/geco2/ckpts/GECO2_IOCfish_test_results.txt  ← MAE/RMSE/NAE
+
+    ── Training on IOCfish ──────────────────────────────────────────────────
+        apptainer exec --nv \
+            --bind /path/to/IOCfish_done:/opt/geco2/IOCfish5kDataset/done \
+            --bind /path/to/output:/opt/geco2/output \
+            geco2.sif \
+            python3 /opt/geco2/train_on_IOCfish_dataset.py \
+                --output_dir /opt/geco2/output
+
+    ── Interactive Gradio demo ──────────────────────────────────────────────
+        apptainer exec --nv \
+            --bind /path/to/CNTQG_multitrain_ca44.pth:/opt/geco2/CNTQG_multitrain_ca44.pth \
+            geco2.sif \
+            bash -c "cd /opt/geco2 && python3 demo_gradio.py"
+
+        Then open the printed URL in a browser (use SSH port-forwarding on HPC).
+
+%environment
+    export CUDA_HOME=/usr/local/cuda
+    export TORCH_CUDA_ARCH_LIST="6.0 6.1 7.0 7.5 8.0 8.6+PTX"
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONUNBUFFERED=1
+    export PATH="/opt/venv/bin:$PATH"
+    export DEBIAN_FRONTEND=noninteractive
+
+# Files are copied BEFORE %post runs.
+# All paths on the left are relative to the directory where you run `apptainer build`.
+%files
+    req.txt                                        /opt/geco2/req.txt
+    gradio_image_prompter-0.1.0-py3-none-any.whl  /opt/geco2/gradio_image_prompter-0.1.0-py3-none-any.whl
+    Deformable-DETR                                /opt/geco2/Deformable-DETR
+    configs                                        /opt/geco2/configs
+    utils                                          /opt/geco2/utils
+    models                                         /opt/geco2/models
+    sam2                                           /opt/geco2/sam2
+    inference.py                                   /opt/geco2/inference.py
+    inference_on_IOCfish_dataset.py                /opt/geco2/inference_on_IOCfish_dataset.py
+    eval_bboxes.py                                 /opt/geco2/eval_bboxes.py
+    train.py                                       /opt/geco2/train.py
+    train_on_IOCfish_dataset.py                    /opt/geco2/train_on_IOCfish_dataset.py
+    demo_gradio.py                                 /opt/geco2/demo_gradio.py
+    app.py                                         /opt/geco2/app.py
+
+%post
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    export PATH="/opt/venv/bin:$PATH"
+    export CUDA_HOME=/usr/local/cuda
+    export TORCH_CUDA_ARCH_LIST="6.0 6.1 7.0 7.5 8.0 8.6+PTX"
+
+    # ── 1. System packages ────────────────────────────────────────────────
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ninja-build \
+        gcc-11 \
+        python3 \
+        python3-dev \
+        python3-pip \
+        python3-venv \
+        ffmpeg \
+        libsm6 \
+        libxext6 \
+        ca-certificates \
+        curl \
+        git \
+        apt-transport-https \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+    # ── 2. Python virtual environment ────────────────────────────────────
+    python3 -m venv /opt/venv
+    pip install --upgrade pip wheel
+
+    # ── 3. Python packages from req.txt ──────────────────────────────────
+    pip install -r /opt/geco2/req.txt
+
+    # Install the bundled gradio_image_prompter wheel
+    pip install /opt/geco2/gradio_image_prompter-0.1.0-py3-none-any.whl
+
+    # Ensure numpy < 2 (required by pycocotools / SAM2)
+    pip install "numpy<2"
+
+    # ── 4. SAM2 (local copy) ─────────────────────────────────────────────
+    cd /opt/geco2/sam2
+    pip install ".[dev]" --no-build-isolation
+
+    # ── 5. Deformable-DETR custom CUDA ops ───────────────────────────────
+    # Copy ops into models/ as expected by the inference scripts
+    cp -r /opt/geco2/Deformable-DETR/models/ops /opt/geco2/models/ops
+
+    cd /opt/geco2/Deformable-DETR/models/ops
+    CC=/usr/bin/gcc-11 python3 setup.py build
+    pip install .
+
+    # ── 6. Clean build artefacts to reduce image size ────────────────────
+    find /opt/geco2 -name "*.pyc" -delete
+    find /opt/geco2 -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+
+%runscript
+    # Default: run the inference script.
+    # Override by passing a full `python3 /opt/geco2/...` command to `exec`.
+    cd /opt/geco2
+    exec python3 "$@"

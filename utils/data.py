@@ -273,11 +273,13 @@ class IOCFish5kDataset(Dataset):
         self.resize512 = T.Resize((512, 512), antialias=True)
         self.jitter = T.RandomApply([T.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8)
 
-        # Collect IDs that have both a .jpg and a valid XML with at least one bbox
+        # Collect IDs that have both a .jpg/.png and a valid XML with at least one bbox
         all_xml = sorted(self.data_path.glob('*.xml'))
         all_ids = []
         for xml_path in all_xml:
             img_path = self.data_path / f'{xml_path.stem}.jpg'
+            if not img_path.exists():
+                img_path = self.data_path / f'{xml_path.stem}.png'
             if not img_path.exists():
                 continue
             anns = self._parse_xml(xml_path)
@@ -340,6 +342,8 @@ class IOCFish5kDataset(Dataset):
     def __getitem__(self, idx: int):
         img_id = self.image_ids[idx]
         img_path = self.data_path / f'{img_id}.jpg'
+        if not img_path.exists():
+            img_path = self.data_path / f'{img_id}.png'
         xml_path = self.data_path / f'{img_id}.xml'
 
         img = T.ToTensor()(Image.open(img_path).convert('RGB'))

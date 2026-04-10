@@ -343,9 +343,21 @@ class AnnotationState:
         self.pan_y = 0.0
 
         # Window layout - capped to fit the screen
-        _user32 = ctypes.windll.user32
-        _scr_w = _user32.GetSystemMetrics(0)   # SM_CXSCREEN  (physical px)
-        _scr_h = _user32.GetSystemMetrics(1)   # SM_CYSCREEN  (physical px)
+        try:
+            _user32 = ctypes.windll.user32
+            _scr_w = _user32.GetSystemMetrics(0)   # SM_CXSCREEN  (physical px)
+            _scr_h = _user32.GetSystemMetrics(1)   # SM_CYSCREEN  (physical px)
+        except AttributeError:
+            # Non-Windows: try tkinter, fall back to a sensible default
+            try:
+                import tkinter as _tk
+                _root = _tk.Tk()
+                _root.withdraw()
+                _scr_w = _root.winfo_screenwidth()
+                _scr_h = _root.winfo_screenheight()
+                _root.destroy()
+            except Exception:
+                _scr_w, _scr_h = 1920, 1080
         self.win_w = min(1600, _scr_w - 40)
         self.win_h = min(900,  _scr_h - 100)   # room for title-bar + taskbar
         self.panel_w = 0
