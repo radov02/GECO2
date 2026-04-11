@@ -118,8 +118,7 @@ def resize_and_pad(img, bboxes, density_map=None, gt_bboxes=None, size=1024.0, z
         resized_density_map = torch.nn.functional.interpolate(resized_density_map, scale_factor=scaling_factor,
                                                             mode='bilinear',
                                                             align_corners=False)
-        padded_density_map = \
-            torch.nn.functional.pad(resized_density_map, (0, pad_width, 0, pad_height), mode='constant', value=0)[0]
+        padded_density_map = torch.nn.functional.pad(resized_density_map, (0, pad_width, 0, pad_height), mode='constant', value=0)[0]
         padded_density_map = resize512(padded_density_map)
         padded_density_map = padded_density_map / padded_density_map.sum() * original_sum
 
