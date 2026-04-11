@@ -86,11 +86,17 @@
     - `mkdir -p /d/hpc/home/er52565/GECO2/results /d/hpc/home/er52565/GECO2/models`
     - `sbatch /d/hpc/home/er52565/_SLING/hpc_train.sh`
 - spremljaj potek treniranja:
-    - stanje posla v čakalni vrsti: `squeue --user=er52565` ali bolje: `watch -n 1 "squeue --partition=gpu | head -n 35"`
+    - stanje posla v čakalni vrsti: `watch -n 1 -d "squeue --user=$USER"` ali bolje: `watch -n 1 -d "squeue --partition=gpu -S -p -O "jobid,partition,name,UserName,priority,StartTime,state,reason,TimeUsed" --states=PD | head -n 35"`
+        - poglej svoj FairShare status: `sshare -U $USER`
+        - poglej svoj Priority Score - koliko točk imaš za Age, Fairshare itd.: `sprio -j <SLURM_JOB_ID>`
+        - poglej estimated start time: `squeue --partition=gpu -o "%.10i %.10u %.10p %.10Q %.10t %.15S %R" --sort=-p`
     - log v živo: `tail -f /d/hpc/home/er52565/GECO2/results/train_<SLURM_JOB_ID>.out`
-    - podrobnosti o poslu (stanje, vozlišče, čas): `watch -n 1 scontrol show job <SLURM_JOB_ID>`
+    - podrobnosti o poslu (stanje, vozlišče, čas): `watch -n 1 -d scontrol show job <SLURM_JOB_ID>`
     - (pregled zaključenih poslov zadnjih 3 dni: `sacct --starttime $(date -d '3 day ago' +%D-%R) --format JobID,JobName,Elapsed,State,ExitCode`)
     - prekini posel po potrebi: `scancel <SLURM_JOB_ID>`
+    - poglej izhode zaključenega posla: 
+        - stdout: `cat /d/hpc/home/er52565/GECO2/results/train_<SLURM_JOB_ID>.out`
+        - stderr: `cat /d/hpc/home/er52565/GECO2/results/train_<SLURM_JOB_ID>.err`
 - prenesi uteži modela na lokalni računalnik:
     - lokalno zaženi `rsync -avP er52565@hpc-login.arnes.si:/d/hpc/home/er52565/GECO2/models/ ~/Diploma-GECO2-with-Depth-information/GECO2/models/`
 

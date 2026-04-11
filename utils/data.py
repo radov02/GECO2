@@ -273,13 +273,18 @@ class IOCFish5kDataset(Dataset):
         self.resize512 = T.Resize((512, 512), antialias=True)
         self.jitter = T.RandomApply([T.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8)
 
+        # Support both flat layout (xml+images in data_path) and
+        # structured layout (data_path/xml/*.xml, data_path/images/*.jpg)
+        self.xml_dir = self.data_path / 'xml' if (self.data_path / 'xml').is_dir() else self.data_path
+        self.img_dir = self.data_path / 'images' if (self.data_path / 'images').is_dir() else self.data_path
+
         # Collect IDs that have both a .jpg/.png and a valid XML with at least one bbox
-        all_xml = sorted(self.data_path.glob('*.xml'))
+        all_xml = sorted(self.xml_dir.glob('*.xml'))
         all_ids = []
         for xml_path in all_xml:
-            img_path = self.data_path / f'{xml_path.stem}.jpg'
+            img_path = self.img_dir / f'{xml_path.stem}.jpg'
             if not img_path.exists():
-                img_path = self.data_path / f'{xml_path.stem}.png'
+                img_path = self.img_dir / f'{xml_path.stem}.png'
             if not img_path.exists():
                 continue
             anns = self._parse_xml(xml_path)
@@ -341,10 +346,10 @@ class IOCFish5kDataset(Dataset):
 
     def __getitem__(self, idx: int):
         img_id = self.image_ids[idx]
-        img_path = self.data_path / f'{img_id}.jpg'
+        img_path = self.img_dir / f'{img_id}.jpg'
         if not img_path.exists():
-            img_path = self.data_path / f'{img_id}.png'
-        xml_path = self.data_path / f'{img_id}.xml'
+            img_path = self.img_dir / f'{img_id}.png'
+        xml_path = self.xml_dir / f'{img_id}.xml'
 
         img = T.ToTensor()(Image.open(img_path).convert('RGB'))
 
