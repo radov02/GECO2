@@ -63,7 +63,8 @@ class PointLossHungarianMatcher(nn.Module):
             cost_giou = - generalized_box_iou(out_bbox, tgt_bbox)
             # Final cost matrix
             C = self.cost_bbox * cost_bbox + self.cost_giou * cost_giou
-            C = C.view(bs, num_queries, -1).cpu()
+            # Use explicit target count instead of -1 to avoid ambiguity when num_queries==0
+            C = C.view(bs, num_queries, tgt_ids.shape[0]).cpu()
 
             sizes = [len(v["boxes"]) for v in targets]
             indices = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
