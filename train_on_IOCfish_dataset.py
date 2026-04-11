@@ -1,4 +1,5 @@
 import argparse
+import csv
 import os
 import random
 from pathlib import Path
@@ -67,7 +68,12 @@ def train(args):
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop, gamma=0.25)
+    # ReduceLROnPlateau monitors val RMSE (lower = better)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min',
+        factor=args.reduce_lr_factor,
+        patience=args.reduce_lr_patience,
+    )
     if args.resume_training:
         checkpoint = torch.load(os.path.join(args.model_path, f'{args.model_name_resume_from}.pth'))
         model.load_state_dict(checkpoint['model'], strict=False)
@@ -135,14 +141,25 @@ def train(args):
     print(rank)
     model_path_abs = os.path.abspath(os.path.join(args.model_path, f'{args.model_name}.pth'))
     txt_path = os.path.abspath(os.path.join(args.model_path, f'{args.model_name}_metrics.txt'))
+    csv_path = os.path.abspath(os.path.join(args.model_path, f'{args.model_name}_metrics.csv'))
     if rank == 0:
         with open(txt_path, 'w') as f:
             f.write(f"Model path: {model_path_abs}\n")
-            f.write(f"\n{'Epoch':>6s}  {'TrainLoss':>10s}  {'ValLoss':>8s}  {'TrainMAE':>9s}  {'ValMAE':>7s}  {'ValRMSE':>8s}  {'TestMAE':>8s}  {'TestRMSE':>9s}  Best\n")
-            f.write('-' * 88 + '\n')
+            f.write(f"\n{'Epoch':>6s}  {'TrainLoss':>10s}  {'ValLoss':>8s}  {'TrainMAE':>9s}  {'ValMAE':>7s}  {'ValRMSE':>8s}  {'TestMAE':>8s}  {'TestRMSE':>9s}  {'EpochTime':>10s}  Best\n")
+            f.write('-' * 100 + '\n')
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Epoch', 'LR', 'TrainLoss', 'ValLoss',
+                             'TrainMAE', 'ValMAE', 'ValRMSE',
+                             'TestMAE', 'TestRMSE', 'EpochTime_s', 'Best'])
+
+    # ── Spike-based early stopping state (rank 0 decides, broadcasts to all) ──
+    spike_count = 0
+    best_spike_rmse = float('inf')
+    stop_flag = torch.zeros(1, dtype=torch.int32, device=device)
+
     for epoch in range(start_epoch + 1, args.epochs + 1):
-        if rank == 0:
-            start = perf_counter()
+        start = perf_counter()  # measured on all ranks; used on rank 0
         train_loss = torch.tensor(0.0).to(device)
         val_loss = torch.tensor(0.0).to(device)
         val_ae = torch.tensor(0.0).to(device)
@@ -237,8 +254,9 @@ def train(args):
                     boxes = (outputs[idx]['pred_boxes'][outputs[idx]['box_v'] > outputs[idx]['box_v'].max() / 8])[keep]
                     nms_bboxes.append(boxes)
                     num_objects_pred.append(len(boxes))
-                    losses.append(l['loss_giou'] + l["loss_ce"])
-                    losses.append(l1['loss_giou'] + l1["loss_ce"])
+                    # Include loss_bbox to keep val loss comparable to train loss
+                    losses.append(l['loss_giou'] + l["loss_ce"] + l["loss_bbox"])
+                    losses.append(l1['loss_giou'] + l1["loss_ce"] + l1["loss_bbox"])
                 num_objects_gt = density_map.flatten(1).sum(dim=1)
                 loss = sum(losses)
 
@@ -276,7 +294,8 @@ def train(args):
                     boxes = (outputs[idx]['pred_boxes'][outputs[idx]['box_v'] > outputs[idx]['box_v'].max() / 8])[keep]
                     nms_bboxes.append(boxes)
                     num_objects_pred.append(len(boxes))
-                    losses.append(l['loss_giou'] + l["loss_ce"])
+                    # Include loss_bbox to keep test loss comparable to train loss
+                    losses.append(l['loss_giou'] + l["loss_ce"] + l["loss_bbox"])
                 num_objects_gt = density_map.flatten(1).sum(dim=1)
                 loss = sum(losses)
 
@@ -299,12 +318,44 @@ def train(args):
         dist.all_reduce(test_rmse)
         dist.all_reduce(test_ae)
 
-        scheduler.step()
+        # ReduceLROnPlateau: all ranks step with the same val RMSE value
+        val_rmse_norm = torch.sqrt(val_rmse / len(val_dataset)).item()
+        scheduler.step(val_rmse_norm)
+        current_lr = optimizer.param_groups[0]['lr']
+
+        stop_flag.zero_()
 
         if rank == 0:
 
             end = perf_counter()
+            epoch_time = end - start
             best_epoch = False
+
+            val_mae_val  = val_ae.item()  / len(val_dataset)
+            val_rmse_val = val_rmse_norm
+            test_mae_val = test_ae.item() / len(test_dataset)
+            test_rmse_val = torch.sqrt(test_rmse / len(test_dataset)).item()
+            train_mae_val = train_ae.item() / len(train_dataset)
+
+            # ── Spike detection ───────────────────────────────────────────
+            if val_rmse_val < best_spike_rmse:
+                best_spike_rmse = val_rmse_val
+                spike_count = 0
+            elif val_rmse_val > args.spike_ratio * best_spike_rmse:
+                spike_count += 1
+                spike_msg = (
+                    f"  *** SPIKE #{spike_count} at epoch {epoch}: "
+                    f"Val RMSE={val_rmse_val:.2f} > {args.spike_ratio}x best "
+                    f"({best_spike_rmse:.2f}). "
+                    f"Stopping in {args.spike_patience - spike_count} more spike(s).\n"
+                )
+                print(spike_msg.strip())
+                with open(txt_path, 'a') as f:
+                    f.write(spike_msg)
+                if spike_count >= args.spike_patience:
+                    stop_flag.fill_(1)
+            else:
+                spike_count = 0  # non-spike regression; reset counter
 
             if val_rmse.item() / len(val_dataset) < best:
                 best = val_rmse.item() / len(val_dataset)
@@ -322,36 +373,56 @@ def train(args):
                     'epoch': epoch,
                     'train_loss': train_loss.item(),
                     'val_loss': val_loss.item(),
-                    'train_mae': train_ae.item() / len(train_dataset),
-                    'val_mae': val_ae.item() / len(val_dataset),
-                    'val_rmse': torch.sqrt(val_rmse / len(val_dataset)).item(),
-                    'test_mae': test_ae.item() / len(test_dataset),
-                    'test_rmse': torch.sqrt(test_rmse / len(test_dataset)).item(),
+                    'train_mae': train_mae_val,
+                    'val_mae': val_mae_val,
+                    'val_rmse': val_rmse_val,
+                    'test_mae': test_mae_val,
+                    'test_rmse': test_rmse_val,
+                    'epoch_time': epoch_time,
                 }
 
             print(
                 f"-----------------------------------------------",
                 f"Epoch: {epoch}",
+                f"LR: {current_lr:.2e}",
                 f"Train loss: {train_loss.item():.3f}",
                 f"Val loss: {val_loss.item():.3f}",
-                f"Train MAE: {train_ae.item() / len(train_dataset):.3f}",
-                f"Val MAE: {val_ae.item() / len(val_dataset):.3f}",
-                f"Val RMSE: {torch.sqrt(val_rmse / len(val_dataset)).item():.2f}",
-                f"Test MAE: {test_ae.item() / len(test_dataset):.3f}",
-                f"Test RMSE: {torch.sqrt(test_rmse / len(test_dataset)).item():.2f}",
-                f"Epoch time: {end - start:.3f} seconds",
+                f"Train MAE: {train_mae_val:.3f}",
+                f"Val MAE: {val_mae_val:.3f}",
+                f"Val RMSE: {val_rmse_val:.2f}",
+                f"Test MAE: {test_mae_val:.3f}",
+                f"Test RMSE: {test_rmse_val:.2f}",
+                f"Epoch time: {epoch_time:.3f} seconds",
                 'best' if best_epoch else ''
             )
             with open(txt_path, 'a') as f:
                 f.write(
                     f"{epoch:>6d}  {train_loss.item():>10.3f}  {val_loss.item():>8.3f}  "
-                    f"{train_ae.item() / len(train_dataset):>9.3f}  "
-                    f"{val_ae.item() / len(val_dataset):>7.3f}  "
-                    f"{torch.sqrt(val_rmse / len(val_dataset)).item():>8.2f}  "
-                    f"{test_ae.item() / len(test_dataset):>8.3f}  "
-                    f"{torch.sqrt(test_rmse / len(test_dataset)).item():>9.2f}  "
+                    f"{train_mae_val:>9.3f}  "
+                    f"{val_mae_val:>7.3f}  "
+                    f"{val_rmse_val:>8.2f}  "
+                    f"{test_mae_val:>8.3f}  "
+                    f"{test_rmse_val:>9.2f}  "
+                    f"{epoch_time:>10.1f}  "
                     f"{'*' if best_epoch else ''}\n"
                 )
+            with open(csv_path, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    epoch, f'{current_lr:.2e}',
+                    f'{train_loss.item():.4f}', f'{val_loss.item():.4f}',
+                    f'{train_mae_val:.4f}', f'{val_mae_val:.4f}', f'{val_rmse_val:.4f}',
+                    f'{test_mae_val:.4f}', f'{test_rmse_val:.4f}',
+                    f'{epoch_time:.1f}',
+                    '*' if best_epoch else ''
+                ])
+
+        # Broadcast early-stop decision from rank 0 to all workers
+        dist.broadcast(stop_flag, src=0)
+        if stop_flag.item() == 1:
+            if rank == 0:
+                print(f"Early stopping triggered after {spike_count} consecutive spikes.")
+            break
     dist.destroy_process_group()
 
     if rank == 0 and best_metrics is not None:
@@ -364,7 +435,18 @@ def train(args):
             f.write(f"  Val RMSE:   {best_metrics['val_rmse']:.2f}\n")
             f.write(f"  Test MAE:   {best_metrics['test_mae']:.3f}\n")
             f.write(f"  Test RMSE:  {best_metrics['test_rmse']:.2f}\n")
+            f.write(f"  Epoch time: {best_metrics['epoch_time']:.1f}s\n")
+        with open(csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([])  # blank separator
+            writer.writerow(['# Best epoch', best_metrics['epoch'],
+                             '', '',
+                             best_metrics['train_mae'], best_metrics['val_mae'],
+                             best_metrics['val_rmse'],
+                             best_metrics['test_mae'], best_metrics['test_rmse'],
+                             best_metrics['epoch_time'], '*'])
         print(f"Metrics saved to: {txt_path}")
+        print(f"CSV saved to:     {csv_path}")
 
 
 if __name__ == '__main__':
@@ -389,10 +471,14 @@ if __name__ == '__main__':
         kernel_dim=3,
         num_objects=3,
         # Training hyper-parameters
-        epochs=10,
+        epochs=200,
         lr=1e-5,
         backbone_lr=0.0,
-        lr_drop=50,
+        lr_drop=50,          # unused (ReduceLROnPlateau is used instead)
+        reduce_lr_patience=5,
+        reduce_lr_factor=0.25,
+        spike_patience=2,
+        spike_ratio=2.0,
         weight_decay=1e-4,
         batch_size=4,
         dropout=0.1,

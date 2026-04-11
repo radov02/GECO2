@@ -49,4 +49,16 @@ def get_argparser():
     parser.add_argument("--focal_alpha", default=0.25, type=float)
     parser.add_argument("--model_name_resume_from", default='base_3_shot_softmax1', type=str)
 
+    # ReduceLROnPlateau
+    parser.add_argument('--reduce_lr_patience', default=5, type=int,
+                        help='Epochs with no val RMSE improvement before LR is reduced')
+    parser.add_argument('--reduce_lr_factor', default=0.25, type=float,
+                        help='Factor by which LR is reduced (new_lr = lr * factor)')
+
+    # Spike-based early stopping
+    parser.add_argument('--spike_patience', default=2, type=int,
+                        help='Stop after this many consecutive val RMSE spikes')
+    parser.add_argument('--spike_ratio', default=2.0, type=float,
+                        help='Val RMSE is a "spike" when it exceeds spike_ratio * best val RMSE')
+
     return parser
