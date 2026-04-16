@@ -6,6 +6,15 @@ import torch.nn.functional as F
 
 
 def boxes_with_scores(density_map, tlrb, sort=False, validate=False):
+    """
+    - firstly we find candidate locations from density map (centerness_aux objectness heatmap) using a local peak finding method
+    - then we use this obtained mask (candidate object centers) and extract the scores from density map (centerness_aux objectness heatmap)
+    - we then read the TLRB box offsets at the candidate locations
+    - then we obtain the bbox coordinates bbox_xyxy = [cx - left, cy - top, cx + right, cy + bottom]
+    - output outputs_aux is a list of of dicts (one per element in the batch) that include:
+        - bboxes in xyxy format - normalized coordinates to [0, 1]
+        - centerness score at each box center
+    """
     B, C, _, _ = density_map.shape  # B, 1, H, W
 
     # maxpool instead of scikit local peak
@@ -47,8 +56,8 @@ def boxes_with_scores(density_map, tlrb, sort=False, validate=False):
             ref_points = ref_points[perm]
 
         out_batch.append({
-            "pred_boxes": bbox_xyxy.unsqueeze(0),
-            "box_v": bbox_scores.unsqueeze(0)
+            "pred_boxes": bbox_xyxy.unsqueeze(0),    # [num_boxes, 4] bbox coordinates in xyxy format
+            "box_v": bbox_scores.unsqueeze(0)       # [num_boxes, 1] centerness scores at the box centers
         })
         ref_points_batch.append(ref_points.T)
 

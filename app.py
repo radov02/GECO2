@@ -4,7 +4,7 @@ import torch
 import gradio as gr
 from gradio_image_prompter import ImagePrompter
 from torch.nn import DataParallel
-from models.counter_infer import build_model
+from models.counter import build_model
 from utils.arg_parser import get_argparser
 from utils.data import resize_and_pad
 import torchvision.ops as ops

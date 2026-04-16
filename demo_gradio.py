@@ -3,7 +3,7 @@ import torch
 import gradio as gr
 from gradio_image_prompter import ImagePrompter
 from torch.nn import DataParallel
-from models.counter_infer import build_model
+from models.counter import build_model
 from utils.arg_parser import get_argparser
 from utils.data import resize_and_pad
 import torchvision.ops as ops
@@ -19,7 +19,7 @@ def load_model():
     args = get_argparser().parse_args()
     args.zero_shot = True
     model = DataParallel(build_model(args).to(device))
-    model.load_state_dict(torch.load('CNTQG_multitrain_ca44.pth', weights_only=True)['model'], strict=False)
+    model.load_state_dict(torch.load('CNTQG_multitrain_ca44.pth', weights_only=False, map_location=device)['model'], strict=False)
     model.eval()
     return model, device
 

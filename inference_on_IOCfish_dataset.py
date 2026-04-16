@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from torchvision import ops
 from tqdm import tqdm
 
-from models.counter_infer import build_model
+from models.counter import build_model
 from models.matcher import build_matcher
 from utils.arg_parser import get_argparser
 from utils.data import IOCFish5kDataset, pad_collate_test
@@ -85,7 +85,8 @@ def evaluate(args):
 
         num_objects_pred = []
         pred_boxes_batch = []
-        for idx in range(img.shape[0]):
+        batch_size = img.size(0)
+        for idx in range(batch_size):
             thr = 1 / 0.11
 
             if len(outputs[idx]['pred_boxes'][-1]) == 0:
@@ -118,7 +119,7 @@ def evaluate(args):
         ae += torch.abs(num_objects_gt - num_objects_pred_t).sum()
         se += torch.pow(num_objects_gt - num_objects_pred_t, 2).sum()
 
-        for idx in range(img.shape[0]):
+        for idx in range(batch_size):
             per_image_results.append({
                 'image_idx': ids[idx].item(),
                 'gt_count': num_objects_gt[idx].item(),
@@ -126,7 +127,7 @@ def evaluate(args):
             })
 
         # Save visualizations: predicted bboxes and centers (per image in batch)
-        for idx in range(img.shape[0]):
+        for idx in range(batch_size):
             pred_boxes = pred_boxes_batch[idx]
 
             # Load the original (unpadded, unnormalized) image from disk

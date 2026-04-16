@@ -1,8 +1,15 @@
+import os
+import sys
 from typing import Tuple
 
 import torch
 
 from torch import nn
+
+# Add Deformable-DETR ops to path so that 'modules.ms_deform_attn' can be found
+_ops_path = os.path.join(os.path.dirname(__file__), '..', 'Deformable-DETR', 'models', 'ops')
+if _ops_path not in sys.path:
+    sys.path.insert(0, os.path.abspath(_ops_path))
 
 from models.regression_head import UpsamplingLayer
 from models.transformer import SelfCrossAttentionBlock, PrototypeAttentionBlock
@@ -78,6 +85,11 @@ class C_base(nn.Module):
 
         self.level_start_index1 = torch.tensor([[0]])
 
+        # Pre-compute reference points (will be recomputed if device changes)
+        self.reference_points = self.get_reference_points(self.spatial_shapes, self.valid_ratios)
+        self.reference_points1 = self.get_reference_points(self.spatial_shapes1, self.valid_ratios1)
+        self.reference_points2 = self.get_reference_points(self.spatial_shapes2, self.valid_ratios2)
+
 
     def init_weights(m):
         if isinstance(m, nn.Linear):
@@ -86,6 +98,14 @@ class C_base(nn.Module):
 
     @staticmethod
     def get_reference_points(spatial_shapes, valid_ratios, device='cpu'):
+        """Get the reference points used for deformable attention. These reference points serve as the sampling locations for MSDeformAttn, telling the attention module where to look in the feature maps for each query position.
+        - iterate over each feature map level - spatial_shapes
+        - create meshgrid - evenly spaced points (reference points) across the feature map, offset by 0.5 to be pixel-center aligned
+        - normalize the grid coordinates to [0, 1] range by dividing by the valid (non-padded) spatial extent
+        - stack x and y into (x, y) coordinate pairs per level
+        - concatenate reference points from all levels into a single tensor
+        - scale the reference points across all levels using valid_ratios, so each level's points are mapped into the valid region of every other level
+        """
         reference_points_list = []
         for lvl, (H_, W_) in enumerate(spatial_shapes):
             ref_y, ref_x = torch.meshgrid(torch.linspace(0.5, H_ - 0.5, H_, dtype=torch.float32, device=device),

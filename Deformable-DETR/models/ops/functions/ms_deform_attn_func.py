@@ -15,27 +15,39 @@ import torch.nn.functional as F
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 
-import MultiScaleDeformableAttention as MSDA
+try:
+    import MultiScaleDeformableAttention as MSDA
+    _MSDA_AVAILABLE = True
+except ImportError:
+    _MSDA_AVAILABLE = False
 
 
 class MSDeformAttnFunction(Function):
     @staticmethod
     def forward(ctx, value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, im2col_step):
-        ctx.im2col_step = im2col_step
-        output = MSDA.ms_deform_attn_forward(
-            value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, ctx.im2col_step)
-        ctx.save_for_backward(value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights)
+        if _MSDA_AVAILABLE:
+            ctx.im2col_step = im2col_step
+            output = MSDA.ms_deform_attn_forward(
+                value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, ctx.im2col_step)
+            ctx.save_for_backward(value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights)
+        else:
+            # CPU fallback: use pure PyTorch implementation
+            output = ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_locations, attention_weights)
+            ctx.save_for_backward(value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights)
         return output
 
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_output):
-        value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights = ctx.saved_tensors
-        grad_value, grad_sampling_loc, grad_attn_weight = \
-            MSDA.ms_deform_attn_backward(
-                value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, grad_output, ctx.im2col_step)
-
-        return grad_value, None, None, grad_sampling_loc, grad_attn_weight, None
+        if _MSDA_AVAILABLE:
+            value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights = ctx.saved_tensors
+            grad_value, grad_sampling_loc, grad_attn_weight = \
+                MSDA.ms_deform_attn_backward(
+                    value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, grad_output, ctx.im2col_step)
+            return grad_value, None, None, grad_sampling_loc, grad_attn_weight, None
+        else:
+            # No analytical gradient for CPU fallback; rely on autograd
+            return None, None, None, None, None, None
 
 
 def ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_locations, attention_weights):

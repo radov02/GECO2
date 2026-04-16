@@ -363,6 +363,11 @@ class SetCriterion(nn.Module):
     #     return centerness_gt, mask
     
     def generate_centerness_gt(self, indices, FN_idx, FP_idx, outputs, targets, centerness, ref_points):
+        """
+        build:
+            - centerness_gt (objectness heatmap) from ground truth bboxes, which is used as the target for the centerness prediction branch of the model
+            - mask, which is used to indicate which pixels should be considered for the centerness (determines on which pixels the centerness loss is computed). 1 means the pixel is used for loss computation and 0 means the pixel is ignored in the loss computation
+        """
         FN_bboxes = targets[0]['boxes'][FN_idx] * centerness.shape[1]
 
         centerness_gt = torch.zeros_like(centerness)
@@ -461,6 +466,7 @@ class SetCriterion(nn.Module):
 
         # Retrieve the matching between the outputs of the last layer and the targets
         indices, FN_idx, FP_idx = self.matcher(outputs, targets)
+        # matched indices, non-matched GT indices (undetected objects), non-matched PRED indices (false predictions)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)

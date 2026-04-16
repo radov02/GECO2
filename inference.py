@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from torchvision import ops
 from torchvision.transforms import Resize
 from tqdm import tqdm
-from models.counter_infer import build_model
+from models.counter import build_model
 from models.matcher import build_matcher
 from utils.arg_parser import get_argparser
 from utils.box_ops import BoxList

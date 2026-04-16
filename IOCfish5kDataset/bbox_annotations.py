@@ -1,17 +1,31 @@
 """
 Estimate bounding boxes from point annotations.
 
-Three methods:
-  --method watershed   marker-controlled watershed on RGB (no GPU)
-  --method sam2        SAM 2 single-point prompting  (needs GPU + checkpoint)
-  --method combined    SAM 2 + GECO2 – keeps the more confident bbox per point
-                       (needs GPU + GECO2 checkpoint)
+Available methods:
+  watershed  - marker-controlled watershed on RGB, no GPU needed
+  sam2       - SAM 2 with single-point prompts, needs GPU
+  combined   - SAM 2 + GECO2, picks the more confident bbox per point
+  rgbd       - SAM 2 on RGB and depth colormap independently, fuses results
 
-Draws bboxes + center dots and saves results to images/bbox_annotated/.
-Run from inside the dataset folder or adjust BASE_DIR.
+Default folder structure (inside IOCfish5kDataset/):
+
+  point_annotations/          <-- input
+    images/   ####.jpg           RGB images
+    color/    ####_depth.jpg     depth colormaps
+    xml/      ####.xml           point-only annotations
+
+  annotated_images/           <-- output
+    images/   ####.jpg           copied from point_annotations/images/
+    color/    ####_depth.jpg     copied from point_annotations/color/
+    xml/      ####.xml           new XMLs with bounding boxes
+
+When a bbox XML is written, the corresponding image and depth file
+are copied into annotated_images/ so that inputs and outputs stay
+together. All paths can be overridden via CLI arguments.
 """
 
 import argparse
+import shutil
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -19,46 +33,52 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# ── SAM 2 path setup (deferred import) ─────────────────────────────────────────
-# Add the GECO2 root (parent of the sam2 repo dir) so that `import sam2`
-# resolves to sam2/ and `sam2.sam2` resolves to sam2/sam2/ (the package).
+# Add the GECO2 root so that "import sam2" resolves to sam2/ inside the repo.
 SAM2_ROOT = Path(__file__).resolve().parent.parent
 if str(SAM2_ROOT) not in sys.path:
     sys.path.insert(0, str(SAM2_ROOT))
 
-# ── paths ──────────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent
-IMG_DIR  = BASE_DIR / "images"
-ANN_DIR  = BASE_DIR / "annotations"
-OUT_DIR  = IMG_DIR  / "bbox_annotated"
-XML_DIR  = OUT_DIR  / "xml"
+# Default paths relative to the dataset folder.
+# Input lives under point_annotations/, output under annotated_images/.
+BASE_DIR       = Path(__file__).parent
+IN_DIR         = BASE_DIR / "point_annotations"
+IMG_DIR        = IN_DIR / "images"
+ANN_DIR        = IN_DIR / "xml"
+DEPTH_DIR      = IN_DIR / "color"
+OUT_DIR        = BASE_DIR / "annotated_images"
+OUT_IMG_DIR    = OUT_DIR / "images"
+OUT_XML_DIR    = OUT_DIR / "xml"
+OUT_DEPTH_DIR  = OUT_DIR / "color"
 
-# ── visual settings ────────────────────────────────────────────────────────────
+# Visualization colors (BGR) and line settings.
 DOT_RADIUS     = 4
-DOT_COLOR      = (0, 0, 255)      # red  (BGR)
-BBOX_COLOR     = (0, 255, 0)      # green (BGR)
+DOT_COLOR      = (0, 0, 255)      # red
+BBOX_COLOR     = (0, 255, 0)      # green
 BBOX_THICKNESS = 2
-TEXT_COLOR     = (0, 255, 255)     # yellow (BGR)
-BBOX_PAD_FRAC  = 0.10             # 10 % padding around watershed bbox
+TEXT_COLOR     = (0, 255, 255)    # yellow
+BBOX_PAD_FRAC  = 0.10            # 10% padding added around each bbox
 
-# ── SAM 2 settings ─────────────────────────────────────────────────────────────
-SAM2_HF_MODEL_ID = "facebook/sam2-hiera-base-plus"    # auto-downloaded
-SAM2_MIN_MASK_PX  = 10       # ignore masks smaller than this many pixels
+# SAM 2 model and mask settings.
+SAM2_HF_MODEL_ID  = "facebook/sam2-hiera-base-plus"  # downloaded on first run
+SAM2_MIN_MASK_PX  = 10   # masks smaller than this are treated as failures
 
-# ── GECO2 settings ─────────────────────────────────────────────────────────────
+# RGB-D fusion thresholds.
+RGBD_IOU_AGREE_THR   = 0.25  # masks with IoU above this are considered agreeing
+RGBD_SCORE_DOMINANCE = 1.5   # one modality dominates if its score is this times higher
+RGBD_DEPTH_COMPACT_W = 0.8   # prefer depth mask if it is smaller and at least this fraction of rgb score
+
+# GECO2 model settings.
 GECO2_IMAGE_SIZE  = 1024
 GECO2_EMB_DIM     = 256
 GECO2_REDUCTION   = 16
 GECO2_KERNEL_DIM  = 1
-GECO2_NUM_OBJECTS = 3        # number of exemplar boxes for GECO2
+GECO2_NUM_OBJECTS = 3     # number of exemplar boxes passed to GECO2
 GECO2_NMS_THR     = 0.5
-GECO2_SCORE_DIV   = 0.11     # thr = 1 / SCORE_DIV (from inference.py)
+GECO2_SCORE_DIV   = 0.11  # score threshold is 1 / SCORE_DIV (matches inference.py)
 
-
-# ── helpers ────────────────────────────────────────────────────────────────────
 
 def parse_points(xml_path: Path) -> list[tuple[int, int]]:
-    """Return list of (x, y) from a Pascal-VOC-style point annotation."""
+    """Read center-point annotations from a Pascal-VOC XML file."""
     tree = ET.parse(xml_path)
     root = tree.getroot()
     points = []
@@ -72,7 +92,7 @@ def parse_points(xml_path: Path) -> list[tuple[int, int]]:
 
 
 def _fish_scale(points: list[tuple[int, int]], h: int, w: int) -> int:
-    """Median nearest-neighbour distance – a proxy for typical fish size."""
+    """Estimate a typical fish size as the median nearest-neighbor distance."""
     if len(points) <= 1:
         return min(h, w) // 10
     pts = np.array(points, dtype=np.float32)
@@ -85,7 +105,7 @@ def _fish_scale(points: list[tuple[int, int]], h: int, w: int) -> int:
 
 
 def _pad_box(bx, by, bw, bh, h, w, frac=BBOX_PAD_FRAC):
-    """Add proportional padding and clamp to image bounds."""
+    """Expand bbox by a fraction of its size and clamp to image bounds."""
     px = max(1, int(bw * frac))
     py = max(1, int(bh * frac))
     bx = max(0, bx - px)
@@ -96,7 +116,7 @@ def _pad_box(bx, by, bw, bh, h, w, frac=BBOX_PAD_FRAC):
 
 
 def _ensure_center_inside(bx, by, bw, bh, cx, cy, h, w):
-    """Shift the box so the annotation centre is guaranteed to be inside."""
+    """Shift/expand the box if the annotated center point falls outside it."""
     if cx < bx:
         bx = max(0, cx - 2)
         bw = min(bw, w - bx)
@@ -110,10 +130,8 @@ def _ensure_center_inside(bx, by, bw, bh, cx, cy, h, w):
     return bx, by, bw, bh
 
 
-# ── SAM 2 point-prompting ──────────────────────────────────────────────────────
-
 def build_sam2_predictor(device: str = "cuda"):
-    """Build and return a SAM2ImagePredictor (downloads weights on first run)."""
+    """Load SAM 2 and return a SAM2ImagePredictor. Downloads weights on first run."""
     import torch
     from hydra import initialize_config_dir
     from hydra.core.global_hydra import GlobalHydra
@@ -121,7 +139,7 @@ def build_sam2_predictor(device: str = "cuda"):
     from sam2.sam2_image_predictor import SAM2ImagePredictor
 
     if device == "cuda" and not torch.cuda.is_available():
-        print("CUDA not available – falling back to CPU (will be slow).")
+        print("CUDA not available, falling back to CPU (will be slow).")
         device = "cpu"
 
     sam2_configs_dir = str(SAM2_ROOT / "sam2" / "sam2_configs")
@@ -131,23 +149,30 @@ def build_sam2_predictor(device: str = "cuda"):
     return SAM2ImagePredictor(model)
 
 
-def compute_bboxes_sam2(
+def _sam2_predict_per_point(
     img_bgr: np.ndarray,
     points: list[tuple[int, int]],
     predictor,
-) -> tuple[list[tuple[int, int, int, int]], list[float]]:
-    """Return (x, y, w, h) bboxes and pIoU confidence scores via SAM 2."""
+) -> tuple[
+    list[tuple[int, int, int, int]],
+    list[float],
+    list[np.ndarray | None],
+]:
+    """
+    Run SAM 2 on each center point and return bboxes, pIoU scores, and masks.
+    Masks are None for points where SAM 2 returned a too-small or empty mask.
+    """
     h, w = img_bgr.shape[:2]
     if not points:
-        return [], []
+        return [], [], []
 
-    # SAM 2 expects RGB
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     predictor.set_image(img_rgb)
 
     scale = _fish_scale(points, h, w)
     bboxes: list[tuple[int, int, int, int]] = []
     confidences: list[float] = []
+    raw_masks: list[np.ndarray | None] = []
 
     for cx, cy in points:
         cx_c = int(np.clip(cx, 0, w - 1))
@@ -159,7 +184,6 @@ def compute_bboxes_sam2(
             multimask_output=True,
         )
 
-        # Pick the mask with the highest predicted IoU
         best_idx = scores.argmax()
         confidence = float(scores[best_idx])
         mask = masks[best_idx]
@@ -167,14 +191,15 @@ def compute_bboxes_sam2(
         coords = cv2.findNonZero(mask.astype(np.uint8))
         if coords is not None and len(coords) >= SAM2_MIN_MASK_PX:
             bx, by, bw, bh = cv2.boundingRect(coords)
+            raw_masks.append(mask.astype(bool))
         else:
             confidence = 0.0
-            # Fallback: square box sized to the estimated scale
             half = scale // 2
             bx = max(0, cx_c - half)
             by = max(0, cy_c - half)
             bw = min(scale, w - bx)
             bh = min(scale, h - by)
+            raw_masks.append(None)
 
         bx, by, bw, bh = _pad_box(bx, by, bw, bh, h, w)
         bx, by, bw, bh = _ensure_center_inside(bx, by, bw, bh, cx_c, cy_c, h, w)
@@ -182,16 +207,24 @@ def compute_bboxes_sam2(
         confidences.append(confidence)
 
     predictor.reset_predictor()
+    return bboxes, confidences, raw_masks
+
+
+def compute_bboxes_sam2(
+    img_bgr: np.ndarray,
+    points: list[tuple[int, int]],
+    predictor,
+) -> tuple[list[tuple[int, int, int, int]], list[float]]:
+    """Run SAM 2 on the RGB image and return (x, y, w, h) bboxes with pIoU scores."""
+    bboxes, confidences, _ = _sam2_predict_per_point(img_bgr, points, predictor)
     return bboxes, confidences
 
-
-# ── watershed segmentation ─────────────────────────────────────────────────────
 
 def compute_bboxes_watershed(
     img_bgr: np.ndarray,
     points: list[tuple[int, int]],
 ) -> tuple[list[tuple[int, int, int, int]], list[float]]:
-    """Return (x, y, w, h) bboxes and scores via watershed segmentation."""
+    """Estimate bboxes using marker-controlled watershed. No GPU required."""
     h, w = img_bgr.shape[:2]
     n = len(points)
     if n == 0:
@@ -201,19 +234,18 @@ def compute_bboxes_watershed(
     max_dim = int(scale * 3)
     min_dim = max(8, scale // 4)
 
-    # Smooth while preserving edges → better watershed result
+    # Bilateral filter smooths noise while keeping edges sharp.
     smooth = cv2.bilateralFilter(img_bgr, 9, 75, 75)
 
-    # ── markers ────────────────────────────────────────────────────────────
     markers = np.zeros((h, w), dtype=np.int32)
 
-    # Background label = 1 along the image border
+    # Label the image border as background (label 1).
     markers[0, :]  = 1
     markers[-1, :] = 1
     markers[:, 0]  = 1
     markers[:, -1] = 1
 
-    # Additional background seeds on a grid, far from any fish centre
+    # Add background seeds on a grid, but only far from any annotation point.
     center_map = np.full((h, w), 255, dtype=np.uint8)
     for cx, cy in points:
         center_map[np.clip(cy, 0, h - 1), np.clip(cx, 0, w - 1)] = 0
@@ -225,7 +257,7 @@ def compute_bboxes_watershed(
             if dist_from_center[gy, gx] > scale * 1.2:
                 markers[gy, gx] = 1
 
-    # Foreground: each fish centre gets its own label (2 … n+1)
+    # Each fish center gets its own foreground label starting at 2.
     marker_r = max(2, scale // 10)
     for i, (cx, cy) in enumerate(points):
         cv2.circle(
@@ -236,10 +268,8 @@ def compute_bboxes_watershed(
             -1,
         )
 
-    # ── watershed ──────────────────────────────────────────────────────────
     cv2.watershed(smooth, markers)
 
-    # ── extract bboxes per label ───────────────────────────────────────────
     bboxes: list[tuple[int, int, int, int]] = []
     for i, (cx, cy) in enumerate(points):
         cx_c = np.clip(cx, 0, w - 1)
@@ -251,7 +281,7 @@ def compute_bboxes_watershed(
         if coords is not None and len(coords) >= min_dim * min_dim // 4:
             bx, by, bw, bh = cv2.boundingRect(coords)
 
-            # ── constrain to max size, centred on annotation ──────────────
+            # Clamp to a reasonable max size centered on the annotation.
             if bw > max_dim:
                 bx = max(0, cx_c - max_dim // 2)
                 bw = min(max_dim, w - bx)
@@ -259,7 +289,7 @@ def compute_bboxes_watershed(
                 by = max(0, cy_c - max_dim // 2)
                 bh = min(max_dim, h - by)
 
-            # ── enforce min size ──────────────────────────────────────────
+            # Enforce a minimum size so tiny regions are still usable.
             if bw < min_dim:
                 bx = max(0, cx_c - min_dim // 2)
                 bw = min(min_dim, w - bx)
@@ -267,7 +297,7 @@ def compute_bboxes_watershed(
                 by = max(0, cy_c - min_dim // 2)
                 bh = min(min_dim, h - by)
         else:
-            # Fallback: square box sized to the estimated scale
+            # Watershed failed for this point, fall back to a square box.
             half = scale // 2
             bx = max(0, cx_c - half)
             by = max(0, cy_c - half)
@@ -281,15 +311,13 @@ def compute_bboxes_watershed(
     return bboxes, [0.0] * len(bboxes)
 
 
-# ── GECO2 counting-model prompting ─────────────────────────────────────────────
-
 def build_geco2_model(checkpoint_path: str, device: str = "cuda"):
-    """Build and return the GECO2 counting model (CNT)."""
+    """Load GECO2 from a checkpoint and return the model in eval mode."""
     import torch
-    from models.counter_infer import build_model
+    from models.counter import build_model
 
     if device == "cuda" and not torch.cuda.is_available():
-        print("CUDA not available \u2013 falling back to CPU (will be slow).")
+        print("CUDA not available, falling back to CPU (will be slow).")
         device = "cpu"
 
     class _Args:
@@ -304,7 +332,7 @@ def build_geco2_model(checkpoint_path: str, device: str = "cuda"):
 
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = ckpt["model"] if "model" in ckpt else ckpt
-    # Strip DataParallel 'module.' prefix
+    # Remove DataParallel "module." prefix if the checkpoint was saved that way.
     state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict, strict=False)
 
@@ -318,7 +346,7 @@ def _preprocess_for_geco2(
     exemplar_bboxes_xyxy: list[tuple[int, int, int, int]],
     image_size: int = GECO2_IMAGE_SIZE,
 ):
-    """Resize + pad image for GECO2 and scale exemplar boxes.
+    """Resize and pad the image to GECO2 input size, scaling exemplar boxes accordingly.
 
     Returns (img_tensor, exemplar_tensor, scaling_factor, (pad_w, pad_h)).
     """
@@ -358,7 +386,7 @@ def _match_detections_to_points(
     h: int,
     w: int,
 ) -> tuple[list[tuple[int, int, int, int]], list[float]]:
-    """Assign the best detected box to each annotation point."""
+    """Match each annotation point to the best GECO2 detection box."""
     result_bboxes: list[tuple[int, int, int, int]] = []
     result_scores: list[float] = []
 
@@ -367,14 +395,14 @@ def _match_detections_to_points(
         best_score = -1.0
 
         if len(boxes_xyxy) > 0:
-            # Prefer the highest-scoring box that contains the point
+            # First try to find the highest-scoring box that contains the point.
             for i in range(len(boxes_xyxy)):
                 x1, y1, x2, y2 = boxes_xyxy[i]
                 if x1 <= cx <= x2 and y1 <= cy <= y2 and scores[i] > best_score:
                     best_idx = i
                     best_score = float(scores[i])
 
-            # Fallback: closest box centre
+            # If no box contains the point, take the nearest box center.
             if best_idx == -1:
                 centres = (boxes_xyxy[:, :2] + boxes_xyxy[:, 2:]) / 2
                 dists = np.hypot(centres[:, 0] - cx, centres[:, 1] - cy)
@@ -403,10 +431,10 @@ def compute_bboxes_geco2(
     geco2_model,
     device: str = "cuda",
 ) -> tuple[list[tuple[int, int, int, int]], list[float]]:
-    """Run GECO2 inference and match detections to annotation points.
-
-    *exemplar_bboxes_xywh*: 3 exemplar boxes in (x, y, w, h) format
-    (typically the top-scoring SAM 2 boxes for this image).
+    """
+    Run GECO2 and assign one detection box per annotation point.
+    exemplar_bboxes_xywh should be 3 representative fish boxes (x, y, w, h),
+    typically picked as the highest-scoring SAM 2 results for this image.
     """
     import torch
     from torchvision import ops
@@ -415,7 +443,7 @@ def compute_bboxes_geco2(
     if not points:
         return [], []
 
-    # Convert exemplars xywh -> xyxy
+    # GECO2 expects exemplars in xyxy format.
     ex_xyxy = [(x, y, x + bw, y + bh) for x, y, bw, bh in exemplar_bboxes_xywh]
 
     img_tensor, ex_tensor, sf, (pad_w, pad_h) = _preprocess_for_geco2(
@@ -427,7 +455,7 @@ def compute_bboxes_geco2(
     with torch.no_grad():
         outputs, _ref, _cent, _coord, _masks = geco2_model(img_tensor, ex_tensor)
 
-    # Post-process (mirrors GECO2/inference.py)
+    # Post-process detections, mirroring the logic in GECO2/inference.py.
     idx = 0
     pred_boxes = outputs[idx]["pred_boxes"]
     if pred_boxes.numel() == 0:
@@ -444,7 +472,7 @@ def compute_bboxes_geco2(
     boxes = torch.clamp(pred_boxes[sel][keep], 0, 1)
     det_scores = outputs[idx]["scores"][sel][keep]
 
-    # Remove detections in the padded area
+    # Discard detections that fall in the padded (empty) area of the image.
     img_sz = float(img_tensor.shape[-1])
     maxw_ = img_sz - pad_w
     maxh_ = img_sz - pad_h
@@ -453,7 +481,7 @@ def compute_bboxes_geco2(
     boxes = boxes[valid]
     det_scores = det_scores[valid]
 
-    # Normalised [0, 1] -> original pixel coordinates
+    # Convert from normalized [0, 1] coordinates back to pixel space.
     boxes_px = (boxes * img_sz / sf).cpu().numpy()
     scores_np = det_scores.cpu().numpy()
 
@@ -467,14 +495,13 @@ def compute_bboxes_combined(
     geco2_model,
     device: str = "cuda",
 ) -> tuple[list[tuple[int, int, int, int]], list[float]]:
-    """Run SAM 2 and GECO2, keeping the more confident bbox per point."""
+    """Run both SAM 2 and GECO2, then keep the higher-confidence bbox per point."""
     if not points:
         return [], []
 
-    # 1. SAM 2 bboxes + confidence
     sam2_bboxes, sam2_scores = compute_bboxes_sam2(img_bgr, points, sam2_predictor)
 
-    # 2. Select top exemplars for GECO2
+    # Pick the top-scoring SAM 2 boxes as exemplars for GECO2.
     n_ex = min(GECO2_NUM_OBJECTS, len(sam2_bboxes))
     ranked = sorted(
         range(len(sam2_scores)), key=lambda i: sam2_scores[i], reverse=True,
@@ -484,12 +511,10 @@ def compute_bboxes_combined(
         ex_idx.append(ex_idx[-1])
     exemplars = [sam2_bboxes[i] for i in ex_idx]
 
-    # 3. GECO2 bboxes + confidence
     geco2_bboxes, geco2_scores = compute_bboxes_geco2(
         img_bgr, points, exemplars, geco2_model, device,
     )
 
-    # 4. Per-point selection: higher confidence wins
     final_bboxes: list[tuple[int, int, int, int]] = []
     final_scores: list[float] = []
     for i in range(len(points)):
@@ -503,7 +528,141 @@ def compute_bboxes_combined(
     return final_bboxes, final_scores
 
 
-# ── XML export ─────────────────────────────────────────────────────────────────
+def _mask_to_bbox_xywh(
+    mask: np.ndarray, cx: int, cy: int, h: int, w: int, scale: int,
+) -> tuple[int, int, int, int]:
+    """Convert a binary mask to (x, y, w, h). Falls back to a square box if the mask is empty."""
+    coords = cv2.findNonZero(mask.astype(np.uint8))
+    if coords is not None and len(coords) >= SAM2_MIN_MASK_PX:
+        bx, by, bw, bh = cv2.boundingRect(coords)
+    else:
+        half = scale // 2
+        bx = max(0, cx - half)
+        by = max(0, cy - half)
+        bw = min(scale, w - bx)
+        bh = min(scale, h - by)
+    bx, by, bw, bh = _pad_box(bx, by, bw, bh, h, w)
+    bx, by, bw, bh = _ensure_center_inside(bx, by, bw, bh, cx, cy, h, w)
+    return bx, by, bw, bh
+
+
+def _fuse_single_point(
+    rgb_mask: np.ndarray | None,
+    rgb_score: float,
+    depth_mask: np.ndarray | None,
+    depth_score: float,
+    cx: int,
+    cy: int,
+    h: int,
+    w: int,
+    scale: int,
+) -> tuple[tuple[int, int, int, int], float]:
+    """
+    Fuse the RGB and depth SAM 2 masks for one point into a single bbox.
+
+    When both masks are valid:
+      - High IoU means they agree, so we use the intersection (tighter box).
+      - If one score clearly dominates, we trust that modality.
+      - If depth produces a smaller, reasonably confident mask, we prefer it
+        since depth boundaries tend to be cleaner at object edges.
+      - Otherwise we take whichever score is higher.
+    If only one mask is valid we use it directly.
+    If neither is valid we fall back to a square box sized by fish scale.
+    """
+    rgb_ok = rgb_mask is not None and rgb_mask.sum() >= SAM2_MIN_MASK_PX
+    depth_ok = depth_mask is not None and depth_mask.sum() >= SAM2_MIN_MASK_PX
+
+    if rgb_ok and depth_ok:
+        intersection = rgb_mask & depth_mask
+        union = rgb_mask | depth_mask
+        union_px = union.sum()
+        iou = float(intersection.sum()) / max(float(union_px), 1.0)
+
+        # Both modalities agree on this region, use the intersection for a tighter box.
+        if iou >= RGBD_IOU_AGREE_THR and intersection.sum() >= SAM2_MIN_MASK_PX:
+            conf = max(rgb_score, depth_score) * (0.5 + 0.5 * iou)
+            return _mask_to_bbox_xywh(intersection, cx, cy, h, w, scale), conf
+
+        # One modality is much more confident, trust it.
+        if rgb_score > depth_score * RGBD_SCORE_DOMINANCE:
+            return _mask_to_bbox_xywh(rgb_mask, cx, cy, h, w, scale), rgb_score
+        if depth_score > rgb_score * RGBD_SCORE_DOMINANCE:
+            return _mask_to_bbox_xywh(depth_mask, cx, cy, h, w, scale), depth_score
+
+        # Depth mask is more compact and reasonably confident, prefer it.
+        rgb_area = float(rgb_mask.sum())
+        depth_area = float(depth_mask.sum())
+        if depth_area < rgb_area and depth_score >= rgb_score * RGBD_DEPTH_COMPACT_W:
+            return _mask_to_bbox_xywh(depth_mask, cx, cy, h, w, scale), depth_score
+
+        # No strong preference, just use the higher score.
+        if rgb_score >= depth_score:
+            return _mask_to_bbox_xywh(rgb_mask, cx, cy, h, w, scale), rgb_score
+        else:
+            return _mask_to_bbox_xywh(depth_mask, cx, cy, h, w, scale), depth_score
+
+    elif rgb_ok:
+        return _mask_to_bbox_xywh(rgb_mask, cx, cy, h, w, scale), rgb_score
+
+    elif depth_ok:
+        return _mask_to_bbox_xywh(depth_mask, cx, cy, h, w, scale), depth_score
+
+    else:
+        # No usable mask from either modality.
+        half = scale // 2
+        bx = max(0, cx - half)
+        by = max(0, cy - half)
+        bw = min(scale, w - bx)
+        bh = min(scale, h - by)
+        bx, by, bw, bh = _pad_box(bx, by, bw, bh, h, w)
+        bx, by, bw, bh = _ensure_center_inside(bx, by, bw, bh, cx, cy, h, w)
+        return (bx, by, bw, bh), 0.0
+
+
+def compute_bboxes_rgbd(
+    img_bgr: np.ndarray,
+    depth_bgr: np.ndarray,
+    points: list[tuple[int, int]],
+    predictor,
+) -> tuple[list[tuple[int, int, int, int]], list[float]]:
+    """
+    Run SAM 2 on the RGB image and separately on the depth colormap,
+    then fuse the resulting masks per annotation point.
+    depth_bgr must be the colorized depth image at the same (or similar) resolution.
+    """
+    h, w = img_bgr.shape[:2]
+    if not points:
+        return [], []
+
+    dh, dw = depth_bgr.shape[:2]
+    if (dh, dw) != (h, w):
+        depth_bgr = cv2.resize(depth_bgr, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    rgb_bboxes, rgb_scores, rgb_masks = _sam2_predict_per_point(
+        img_bgr, points, predictor,
+    )
+    depth_bboxes, depth_scores, depth_masks = _sam2_predict_per_point(
+        depth_bgr, points, predictor,
+    )
+
+    scale = _fish_scale(points, h, w)
+    fused_bboxes: list[tuple[int, int, int, int]] = []
+    fused_scores: list[float] = []
+
+    for i, (cx, cy) in enumerate(points):
+        cx_c = int(np.clip(cx, 0, w - 1))
+        cy_c = int(np.clip(cy, 0, h - 1))
+
+        bbox, conf = _fuse_single_point(
+            rgb_masks[i], rgb_scores[i],
+            depth_masks[i], depth_scores[i],
+            cx_c, cy_c, h, w, scale,
+        )
+        fused_bboxes.append(bbox)
+        fused_scores.append(conf)
+
+    return fused_bboxes, fused_scores
+
 
 def write_bbox_xml(
     xml_path: Path,
@@ -513,7 +672,7 @@ def write_bbox_xml(
     bboxes: list[tuple[int, int, int, int]],
     confidences: list[float] | None = None,
 ) -> None:
-    """Write bbox + centre annotations in Pascal-VOC-style XML."""
+    """Save center points and bounding boxes to a Pascal-VOC-style XML file."""
     h, w, d = img_shape
 
     root = ET.Element("annotation")
@@ -557,15 +716,10 @@ def write_bbox_xml(
     tree.write(xml_path, encoding="unicode", xml_declaration=True)
 
 
-# ── XML parsing (bbox annotations) ─────────────────────────────────────────────
-
 def parse_bbox_xml(
     xml_path: Path,
 ) -> list[tuple[tuple[int, int], tuple[int, int, int, int]]]:
-    """Parse a bbox-annotated XML and return [(center, bbox), ...].
-
-    Each entry is ((cx, cy), (xmin, ymin, xmax, ymax)).
-    """
+    """Read bounding boxes from an annotated XML. Returns [(cx, cy), (xmin, ymin, xmax, ymax)] per object."""
     tree = ET.parse(xml_path)
     root = tree.getroot()
     results = []
@@ -584,8 +738,6 @@ def parse_bbox_xml(
     return results
 
 
-# ── Phase 1: compute bboxes → write XML ────────────────────────────────────────
-
 def generate_bbox_xml(
     img_path: Path,
     ann_xml_path: Path,
@@ -593,10 +745,13 @@ def generate_bbox_xml(
     sam2_predictor=None,
     geco2_model=None,
     device: str = "cuda",
+    depth_dir: Path | None = None,
+    xml_out_dir: Path | None = None,
 ) -> int:
-    """Compute bboxes for one image and write the result as XML.
-
-    Returns the number of objects written (0 if skipped).
+    """
+    Compute bounding boxes for one image and write them to an XML file.
+    depth_dir is required for the rgbd method (expects <stem>_depth.jpg files).
+    Returns the number of annotations written, or 0 if the image was skipped.
     """
     img = cv2.imread(str(img_path))
     if img is None:
@@ -606,7 +761,22 @@ def generate_bbox_xml(
     if not points:
         return 0
 
-    if method == "combined" and sam2_predictor is not None and geco2_model is not None:
+    if method == "rgbd" and sam2_predictor is not None and depth_dir is not None:
+        depth_path = depth_dir / (img_path.stem + "_depth.jpg")
+        if depth_path.exists():
+            depth_img = cv2.imread(str(depth_path))
+        else:
+            depth_img = None
+
+        if depth_img is not None:
+            bboxes, scores = compute_bboxes_rgbd(
+                img, depth_img, points, sam2_predictor,
+            )
+        else:
+            # No depth image found for this frame, fall back to RGB-only SAM 2.
+            bboxes, scores = compute_bboxes_sam2(img, points, sam2_predictor)
+
+    elif method == "combined" and sam2_predictor is not None and geco2_model is not None:
         bboxes, scores = compute_bboxes_combined(
             img, points, sam2_predictor, geco2_model, device,
         )
@@ -615,18 +785,14 @@ def generate_bbox_xml(
     else:
         bboxes, scores = compute_bboxes_watershed(img, points)
 
-    xml_out = XML_DIR / (img_path.stem + ".xml")
+    out_dir = xml_out_dir if xml_out_dir is not None else OUT_XML_DIR
+    xml_out = out_dir / (img_path.stem + ".xml")
     write_bbox_xml(xml_out, img_path, img.shape, points, bboxes, confidences=scores)
     return len(points)
 
 
-# ── Phase 2: read XML → draw annotated image ───────────────────────────────────
-
 def draw_annotated_image(img_path: Path, bbox_xml_path: Path, out_path: Path) -> int:
-    """Read a bbox XML and draw centres + bboxes on the image.
-
-    Returns the number of objects drawn (0 if skipped).
-    """
+    """Draw center dots and bounding boxes from a bbox XML onto the image and save it."""
     img = cv2.imread(str(img_path))
     if img is None:
         return 0
@@ -649,86 +815,190 @@ def draw_annotated_image(img_path: Path, bbox_xml_path: Path, out_path: Path) ->
     return len(entries)
 
 
-# ── main ───────────────────────────────────────────────────────────────────────
+def _copy_if_exists(src: Path, dst: Path) -> bool:
+    """Copy src to dst if src exists. Creates parent dirs as needed."""
+    if not src.exists():
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    return True
+
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Estimate bboxes from point annotations.")
+    parser = argparse.ArgumentParser(
+        description="Estimate bboxes from point annotations.",
+        epilog=(
+            "Default folder layout (all under IOCfish5kDataset/):\n"
+            "  point_annotations/images/  ####.jpg        (input RGB)\n"
+            "  point_annotations/color/   ####_depth.jpg  (input depth)\n"
+            "  point_annotations/xml/     ####.xml        (input points)\n"
+            "  annotated_images/images/   ####.jpg        (copied RGB)\n"
+            "  annotated_images/color/    ####_depth.jpg  (copied depth)\n"
+            "  annotated_images/xml/      ####.xml        (output bboxes)\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "--method",
-        choices=["sam2", "watershed", "combined"],
-        default="combined",
-        help="Segmentation backend (default: combined – SAM 2 + GECO2)",
+        choices=["sam2", "watershed", "combined", "rgbd"],
+        default="rgbd",
+        help="Which method to use (default: rgbd)",
     )
     parser.add_argument(
         "--device",
         default="cuda",
-        help="Torch device for SAM 2 / GECO2 (default: cuda)",
+        help="Torch device to use (default: cuda)",
     )
     parser.add_argument(
         "--geco2_checkpoint",
         type=str,
         default=None,
-        help="Path to GECO2 model checkpoint (.pth). Required for combined.",
+        help="Path to GECO2 checkpoint (.pth). Required for the combined method.",
+    )
+    parser.add_argument(
+        "--img_dir",
+        type=Path,
+        default=None,
+        help="Input RGB images folder. Default: point_annotations/images/",
+    )
+    parser.add_argument(
+        "--ann_dir",
+        type=Path,
+        default=None,
+        help="Input point-annotation XMLs folder. Default: point_annotations/xml/",
+    )
+    parser.add_argument(
+        "--depth_dir",
+        type=Path,
+        default=None,
+        help=(
+            "Input depth colormaps folder (<stem>_depth.jpg). "
+            "Default: point_annotations/color/"
+        ),
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=Path,
+        default=None,
+        help=(
+            "Root output folder. Default: annotated_images/. "
+            "Sub-folders images/, color/, xml/ are created automatically."
+        ),
+    )
+    parser.add_argument(
+        "--vis_out_dir",
+        type=Path,
+        default=None,
+        help="Optional folder for visualization images with drawn bboxes.",
     )
     args = parser.parse_args()
 
-    img_files = sorted(IMG_DIR.glob("*.jpg"))
+    # Resolve input directories.
+    img_dir = args.img_dir.resolve() if args.img_dir else IMG_DIR
+    ann_dir = args.ann_dir.resolve() if args.ann_dir else ANN_DIR
+
+    # Resolve depth directory: explicit flag > color/ sibling of img_dir > default.
+    if args.depth_dir is not None:
+        depth_dir: Path | None = args.depth_dir.resolve()
+    elif (img_dir.parent / "color").is_dir():
+        depth_dir = img_dir.parent / "color"
+    else:
+        depth_dir = DEPTH_DIR if DEPTH_DIR.is_dir() else None
+
+    # Resolve output directories.
+    out_root = args.out_dir.resolve() if args.out_dir else OUT_DIR
+    xml_out_dir   = out_root / "xml"
+    out_img_dir   = out_root / "images"
+    out_depth_dir = out_root / "color"
+    vis_out_dir   = args.vis_out_dir.resolve() if args.vis_out_dir else None
+
+    img_files = sorted(img_dir.glob("*.jpg"))
     if not img_files:
-        print(f"No .jpg files found in {IMG_DIR}")
+        print(f"No .jpg files found in {img_dir}")
         return
 
     sam2_predictor = None
     geco2_model = None
 
-    if args.method in ("combined", "sam2"):
-        # Build GECO2 *before* SAM 2 to avoid Hydra-init conflicts
+    if args.method in ("combined", "sam2", "rgbd"):
+        # GECO2 must be loaded before SAM 2 to avoid Hydra initialization conflicts.
         if args.method == "combined":
             if args.geco2_checkpoint is None:
                 print("Error: --geco2_checkpoint is required for the combined method.")
                 return
-            print("Loading GECO2 model …")
+            print("Loading GECO2...")
             geco2_model = build_geco2_model(args.geco2_checkpoint, device=args.device)
-            print("GECO2 model ready.")
+            print("GECO2 ready.")
 
-        print("Loading SAM 2 model …")
+        if args.method == "rgbd" and depth_dir is None:
+            print(
+                "Warning: no depth folder found. "
+                "Pass --depth_dir or place depth images in point_annotations/color/. "
+                "Will fall back to RGB-only SAM 2 for every image."
+            )
+
+        print("Loading SAM 2...")
         sam2_predictor = build_sam2_predictor(device=args.device)
-        print("SAM 2 model ready.")
+        print("SAM 2 ready.")
 
-    print(f"Found {len(img_files)} images.  Method: {args.method}.")
+    n_depth = 0
+    if depth_dir is not None:
+        n_depth = len(list(depth_dir.glob("*_depth.jpg")))
+    print(f"Found {len(img_files)} images, {n_depth} depth maps. Method: {args.method}.")
 
-    # ── Phase 1: compute bboxes and write XML ──────────────────────────────
-    print(f"Phase 1 – writing bbox XML to {XML_DIR} …")
+    # Ensure output sub-folders exist.
+    for d in (xml_out_dir, out_img_dir, out_depth_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    print(f"Writing bbox XMLs to {xml_out_dir}")
     skipped = 0
+    processed = 0
     for img_path in img_files:
-        ann_xml = ANN_DIR / (img_path.stem + ".xml")
+        ann_xml = ann_dir / (img_path.stem + ".xml")
         if not ann_xml.exists():
             skipped += 1
             continue
+
         count = generate_bbox_xml(
             img_path, ann_xml,
             method=args.method,
             sam2_predictor=sam2_predictor,
             geco2_model=geco2_model,
             device=args.device,
+            depth_dir=depth_dir,
+            xml_out_dir=xml_out_dir,
         )
-        print(f"  {img_path.name}  →  {count} bboxes (xml)", flush=True)
+        if count == 0:
+            continue
+
+        # Copy the source image and depth colormap alongside the new XML.
+        _copy_if_exists(img_path, out_img_dir / img_path.name)
+        if depth_dir is not None:
+            depth_name = img_path.stem + "_depth.jpg"
+            _copy_if_exists(depth_dir / depth_name, out_depth_dir / depth_name)
+
+        processed += 1
+        print(f"  {img_path.name}: {count} bboxes", flush=True)
 
     if skipped:
         print(f"  Skipped {skipped} image(s) with no matching annotation file.")
+    print(f"Processed {processed} image(s). Output in {out_root}")
 
-    # ── Phase 2: read XML and draw annotated images ────────────────────────
-    print(f"Phase 2 – drawing annotated images to {OUT_DIR} …")
-    drawn = 0
-    for img_path in img_files:
-        bbox_xml = XML_DIR / (img_path.stem + ".xml")
-        if not bbox_xml.exists():
-            continue
-        out_path = OUT_DIR / img_path.name
-        count = draw_annotated_image(img_path, bbox_xml, out_path)
-        print(f"  {img_path.name}  →  {count} annotations drawn", flush=True)
-        drawn += 1
-
-    print(f"Done. {drawn} annotated image(s) saved.")
+    # Optional: draw bboxes on images for visual inspection.
+    if vis_out_dir is not None:
+        vis_out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Drawing annotated images to {vis_out_dir}")
+        drawn = 0
+        for img_path in img_files:
+            bbox_xml = xml_out_dir / (img_path.stem + ".xml")
+            if not bbox_xml.exists():
+                continue
+            out_path = vis_out_dir / img_path.name
+            count = draw_annotated_image(img_path, bbox_xml, out_path)
+            if count > 0:
+                print(f"  {img_path.name}: {count} annotations", flush=True)
+                drawn += 1
+        print(f"  {drawn} visualization(s) saved.")
 
 
 if __name__ == "__main__":

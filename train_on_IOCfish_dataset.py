@@ -153,7 +153,7 @@ def train(args):
                              'TrainMAE', 'ValMAE', 'ValRMSE',
                              'TestMAE', 'TestRMSE', 'EpochTime_s', 'Best'])
 
-    # ── Spike-based early stopping state (rank 0 decides, broadcasts to all) ──
+    # Spike-based early stopping state (rank 0 decides, broadcasts to all)
     spike_count = 0
     best_spike_rmse = float('inf')
     stop_flag = torch.zeros(1, dtype=torch.int32, device=device)
@@ -187,9 +187,8 @@ def train(args):
             nms_bboxes = []
             for idx in range(img.shape[0]):
                 target_bboxes = gt_bboxes[idx][torch.logical_not((gt_bboxes[idx] == 0).all(dim=1))] / 1024
-                l = criterion(outputs[idx],
-                              [{"boxes": target_bboxes, "labels": torch.tensor([0] * target_bboxes.shape[0])}],
-                              centerness[idx], ref_points[idx])
+                l = criterion(outputs[idx], [{"boxes": target_bboxes, "labels": torch.tensor([0] * target_bboxes.shape[0])}], centerness[idx], ref_points[idx])
+                            # outputs     , targets                                                                         , centerness     , ref_points
 
                 l1 = criterion(outputs_aux[idx],
                                [{"boxes": target_bboxes, "labels": torch.tensor([0] * target_bboxes.shape[0])}],
@@ -262,7 +261,8 @@ def train(args):
 
                 num_objects_pred = torch.tensor(num_objects_pred)
 
-                val_loss += loss * img.size(0)
+                batch_size = img.size(0)
+                val_loss += loss * batch_size
                 val_ae += torch.abs(
                     num_objects_gt - num_objects_pred
                 ).sum()
@@ -301,7 +301,8 @@ def train(args):
 
                 num_objects_pred = torch.tensor(num_objects_pred)
 
-                test_loss += loss * img.size(0)
+                batch_size = img.size(0)
+                test_loss += loss * batch_size
                 test_ae += torch.abs(
                     num_objects_gt - num_objects_pred
                 ).sum()

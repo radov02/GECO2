@@ -1,5 +1,5 @@
 
-# Pregled označenega dataseta
+# Označevanje dataseta
 
 - lokalno naredi conda environment: 
     - `conda env create -f ~/Diploma-GECO2-with-Depth-information/GECO2/environment.yml`
@@ -17,11 +17,16 @@
                     /images
                     /xml
                 ...
+            /images
             ...
         ...
     ```
     kjer imamo v mapaj color globinske slike, images RGB slike in xml oznake
-- zaženi: `python IOCfish5kDataset/manual_annotations.py --usedivided /home/erik/Diploma-GECO2-with-Depth-information/GECO2/IOCfish5kDataset/divided/n`
+- če smo ročno popravljali:
+    - zaženi za pregled: `python IOCfish5kDataset/manual_annotations.py --usedivided /home/erik/Diploma-GECO2-with-Depth-information/GECO2/IOCfish5kDataset/divided/n`
+- avtomatsko pridobivanje oznak:
+    - zaženi: `python bbox_annotations.py --method rgbd --img_dir /unlabelledimages --ann_dir /pointannotatedimages/xml --depth_dir divided/n/color --xml_out_dir labelledimages/xml --vis_out_dir labelledimages/vis`
+
 
 
 # Začetek
@@ -46,7 +51,7 @@
             - uporabi `python prepare_done_images.py --folder /home/erik/Diploma-GECO2-with-Depth-information/GECO2/IOCfish5kDataset/divided/2300` da pridobiš novo mapo s samo podatki že preverjenih slik:
                 `python prepare_done_images.py --folder /home/erik/Diploma-GECO2-with-Depth-information/GECO2/IOCfish5kDataset/divided/2300`
             - dobiš mapo `/home/erik/Diploma-GECO2-with-Depth-information/GECO2/IOCfish5kDataset/divided/2300_done`
-            - prenesi mapo na HPC: `rsync -avP --progress --mkpath ~/Diploma-GECO2-with-Depth-information/GECO2/IOCfish5kDataset/divided/2300 er52565@hpc-login.arnes.si:/d/hpc/home/er52565/GECO2/IOCfish5kDataset/divided/2300_done`
+            - prenesi mapo na HPC: `rsync -avP --progress --mkpath ~/Diploma-GECO2-with-Depth-information/GECO2/IOCfish5kDataset/divided/2300_done er52565@hpc-login.arnes.si:/d/hpc/home/er52565/GECO2/IOCfish5kDataset/divided`
 - poveži git in GitHub repozitorij:
     - `cd /d/hpc/home/er52565/GECO2`
     - `git init`
@@ -158,4 +163,4 @@
     ```
 - faq:
     - deluje brez GPU, le počaseje
-    - ne potrebuje Deformable-DETR CUDA razširitve, saj direktno kliče `counter_infer.build_model`, ki ne vsebuje deformabilne pozornosti
+    - ne potrebuje Deformable-DETR CUDA razširitve, saj direktno kliče `counter.build_model`, ki ne vsebuje deformabilne pozornosti

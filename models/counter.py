@@ -9,9 +9,9 @@ from torch.nn import functional as F
 from torchvision.ops import roi_align
 
 from utils.box_ops import boxes_with_scores
-from .box_corr import Box_correction
 from .prompt_encoder import PromptEncoder
 from .query_generator import C_base
+from .sam_mask import MaskProcessor
 
 
 class CNT(nn.Module):
@@ -24,11 +24,11 @@ class CNT(nn.Module):
             kernel_dim: int,
             reduction: int,
             zero_shot: bool,
-            training: bool,
+            training: bool = False,
 
     ):
         super(CNT, self).__init__()
-        self.validate = not training
+        self.inference = not training
         self.emb_dim = emb_dim
         self.num_objects = num_objects
         self.reduction = reduction
@@ -76,12 +76,11 @@ class CNT(nn.Module):
             nn.Linear(emb_dim, 1 ** 2 * emb_dim)
         )
 
-
-        if self.validate:
-            self.box_correction = Box_correction(reduction,image_size,emb_dim)
+        if self.inference:
+            self.sam_mask = MaskProcessor(self.emb_dim, self.image_size, reduction)
 
     def forward(self, x, bboxes, tiled=False):
-        num_objects = bboxes.size(1) if not self.zero_shot else self.num_objects
+        num_objects = bboxes.size(1)
         with torch.no_grad():
             feats = self.backbone(x)
         src = feats['vision_features']
@@ -102,7 +101,6 @@ class CNT(nn.Module):
             boxes=bboxes_roi, output_size=self.kernel_dim,
             spatial_scale=1.0 / self.reduction, aligned=True
         ).permute(0, 2, 3, 1).reshape(batch_size, num_objects * self.kernel_dim ** 2, self.emb_dim)
-
 
         l1 = feats['backbone_fpn'][0]
         l2 = feats['backbone_fpn'][1]
@@ -128,8 +126,6 @@ class CNT(nn.Module):
             batch_size, -1, self.emb_dim
         )
 
-
-
         prototype_embeddings = torch.cat([exemplars, shape], dim=1)
         prototype_embeddings_l1 = torch.cat([exemplars_l1, shape], dim=1)
         prototype_embeddings_l2 = torch.cat([exemplars_l2, shape], dim=1)
@@ -150,15 +146,21 @@ class CNT(nn.Module):
         adapted_f = adapted_f.view(batch_size, self.emb_dim, -1).permute(0, 2, 1)
         centerness = self.class_embed(adapted_f).view(batch_size, w, h, 1).permute(0, 3, 1, 2)
         outputs_coord = self.bbox_embed(adapted_f).sigmoid().view(batch_size, w, h, 4).permute(0, 3, 1, 2)
-        outputs, ref_points = boxes_with_scores(centerness, outputs_coord, sort=False, validate=self.validate)
+        outputs, ref_points = boxes_with_scores(centerness, outputs_coord, sort=False, validate=self.inference)
+
         if not self.pretrain:
             adapted_f_aux = adapted_f_aux.view(batch_size, self.emb_dim, -1).permute(0, 2, 1)
             centerness_aux = self.class_embed_aux(adapted_f_aux).view(batch_size, w, h, 1).permute(0, 3, 1, 2)
             outputs_coord_aux = self.bbox_embed_aux(adapted_f_aux).sigmoid().view(batch_size, w, h, 4).permute(0, 3, 1, 2)
-            outputs_aux, ref_points_aux = boxes_with_scores(centerness_aux, outputs_coord_aux, sort=False, validate=self.validate)
+            outputs_aux, ref_points_aux = boxes_with_scores(centerness_aux, outputs_coord_aux, sort=False, validate=self.inference)
 
-        if self.validate:
-            outputs = self.box_correction(feats, outputs, x)
+        if self.inference:
+            # mask processing
+            masks, ious, corrected_bboxes = self.sam_mask(feats, outputs)
+            for i in range(len(outputs)):
+                outputs[i]["scores"] = ious[i]
+                outputs[i]["pred_boxes"] = corrected_bboxes[i].to(outputs[i]["pred_boxes"].device).unsqueeze(0) / x.shape[-1]
+            return outputs, ref_points, centerness, outputs_coord, masks
 
         else:
             for i in range(len(outputs)):
@@ -195,5 +197,5 @@ def build_model(args):
         emb_dim=args.emb_dim,
         reduction=args.reduction,
         kernel_dim=args.kernel_dim,
-        training=args.training
+        training=getattr(args, 'training', False),
     )
