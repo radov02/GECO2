@@ -33,10 +33,16 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Add the GECO2 root so that "import sam2" resolves to sam2/ inside the repo.
+# Add the GECO2 root so that local packages (models, configs, …) are importable.
 SAM2_ROOT = Path(__file__).resolve().parent.parent
 if str(SAM2_ROOT) not in sys.path:
     sys.path.insert(0, str(SAM2_ROOT))
+
+# Add the sam2 repo root so that "import sam2" resolves to GECO2/sam2/sam2/.
+# This avoids needing the package to be installed in the active environment.
+SAM2_REPO = SAM2_ROOT / "sam2"
+if str(SAM2_REPO) not in sys.path:
+    sys.path.insert(0, str(SAM2_REPO))
 
 # Default paths relative to the dataset folder.
 # Input lives under point_annotations/, output under annotated_images/.

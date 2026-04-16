@@ -25,6 +25,7 @@
 - če smo ročno popravljali:
     - zaženi za pregled: `python IOCfish5kDataset/manual_annotations.py --usedivided /home/erik/Diploma-GECO2-with-Depth-information/GECO2/IOCfish5kDataset/divided/n`
 - avtomatsko pridobivanje oznak:
+    - najprej zaženi: `cd /home/erik/Diploma-GECO2-with-Depth-information/GECO2/sam2 && pip install -e . -q 2>&1 | tail -5`
     - zaženi: `python bbox_annotations.py --method rgbd --img_dir /unlabelledimages --ann_dir /pointannotatedimages/xml --depth_dir divided/n/color --xml_out_dir labelledimages/xml --vis_out_dir labelledimages/vis`
 
 

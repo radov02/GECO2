@@ -114,6 +114,7 @@ IOCfish5kDataset/done/**
 IOCfish5kDataset/divided/**
 !IOCfish5kDataset/divided/.gitkeep
 IOCfish5kDataset/.annotation_time.json
+IOCfish5kDataset/my_done_annotated_images/**
 
 # ======================
 # IOCfish5k-D Dataset
