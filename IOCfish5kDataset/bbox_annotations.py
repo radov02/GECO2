@@ -768,7 +768,9 @@ def generate_bbox_xml(
         return 0
 
     if method == "rgbd" and sam2_predictor is not None and depth_dir is not None:
-        depth_path = depth_dir / (img_path.stem + "_depth.jpg")
+        _d1 = depth_dir / (img_path.stem + "_depth.jpg")
+        _d2 = depth_dir / (img_path.stem + ".jpg")
+        depth_path = _d1 if _d1.exists() else _d2
         if depth_path.exists():
             depth_img = cv2.imread(str(depth_path))
         else:
@@ -949,7 +951,8 @@ def main() -> None:
 
     n_depth = 0
     if depth_dir is not None:
-        n_depth = len(list(depth_dir.glob("*_depth.jpg")))
+        n_depth = len(list(depth_dir.glob("*.jpg")))
+
     print(f"Found {len(img_files)} images, {n_depth} depth maps. Method: {args.method}.")
 
     # Ensure output sub-folders exist.
@@ -980,7 +983,9 @@ def main() -> None:
         # Copy the source image and depth colormap alongside the new XML.
         _copy_if_exists(img_path, out_img_dir / img_path.name)
         if depth_dir is not None:
-            depth_name = img_path.stem + "_depth.jpg"
+            _dn1 = img_path.stem + "_depth.jpg"
+            _dn2 = img_path.stem + ".jpg"
+            depth_name = _dn1 if (depth_dir / _dn1).exists() else _dn2
             _copy_if_exists(depth_dir / depth_name, out_depth_dir / depth_name)
 
         processed += 1
