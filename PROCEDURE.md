@@ -25,8 +25,13 @@
 - če smo ročno popravljali:
     - zaženi za pregled: `python IOCfish5kDataset/manual_annotations.py --usedivided /home/erik/Diploma-GECO2-with-Depth-information/GECO2/IOCfish5kDataset/divided/n`
 - avtomatsko pridobivanje oznak:
-    - najprej zaženi: `cd /home/erik/Diploma-GECO2-with-Depth-information/GECO2/sam2 && pip install -e . -q 2>&1 | tail -5`
-    - zaženi: `python bbox_annotations.py --method rgbd --img_dir /unlabelledimages --ann_dir /pointannotatedimages/xml --depth_dir divided/n/color --xml_out_dir labelledimages/xml --vis_out_dir labelledimages/vis`
+    - na VICOS clusterju:
+        - naloži gor začetne datoteke (zaženi na laptopu): `scp -r -P 30688 -i C:\Users\radov\.ssh\id_ed25519 /home/erik/Diploma-GECO2-with-Depth-information/GECO2/IOCfish5kDataset/point_annotations erik@proxy.vicos.si:~/GECO2/IOCfish5kDataset`
+        - compilaj SAM2: `cd ~/GECO2/sam2 && pip install -e .`
+        - zaženi: `cd ~/GECO2 && CUDA_VISIBLE_DEVICES=1 python ~/GECO2/IOCfish5kDataset/bbox_annotations.py --method rgbd`
+    - na laptopu:
+        - najprej zaženi: `cd /home/erik/Diploma-GECO2-with-Depth-information/GECO2/sam2 && pip install -e . -q 2>&1 | tail -5`
+        - zaženi: `python bbox_annotations.py --method rgbd --img_dir /unlabelledimages --ann_dir /pointannotatedimages/xml --depth_dir divided/n/color --xml_out_dir labelledimages/xml --vis_out_dir labelledimages/vis`
 
 
 
