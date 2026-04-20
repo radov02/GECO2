@@ -119,6 +119,8 @@ IOCfish5kDataset/2300_final_pre-unannotation-filtering/**
 IOCfish5kDataset/2300_finllVersion/**
 IOCfish5kDataset/2300_finllVersion_done/**
 IOCfish5kDataset/2300_finllVersion_undone/**
+IOCfish5kDataset/_data/**
+IOCfish5kDataset/auto_annotated_images/**
 # ======================
 # IOCfish5k-D Dataset
 # ======================

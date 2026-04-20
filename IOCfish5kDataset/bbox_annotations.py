@@ -6,6 +6,69 @@ Available methods:
   sam2       - SAM 2 with single-point prompts, needs GPU
   combined   - SAM 2 + GECO2, picks the more confident bbox per point
   rgbd       - SAM 2 on RGB and depth colormap independently, fuses results
+               (default method — described in detail below)
+
+RGBD method — step-by-step pipeline
+====================================
+
+1. **Per-point density estimation**
+   A KD-tree is built over all annotation points.  For each point the
+   nearest-neighbour distance is computed and compared against the median
+   NN distance across the image.  Points that have >= DENSE_MIN_NEIGHBORS
+   neighbours within (median_nn × DENSE_RADIUS_FACTOR) are classified as
+   belonging to a dense cluster and receive a *smaller* local scale
+   (nn_dist × DENSE_SCALE_SHRINK).  Isolated points keep the global
+   fish-scale estimate (median NN distance × 0.7).
+
+2. **Dual SAM 2 inference (RGB + depth)**
+   SAM 2 (facebook/sam2-hiera-base-plus) is run *twice* — once on the
+   original RGB image and once on the colourised depth map — using single-
+   point prompts.  For dense-cluster points the prompt additionally
+   includes a tight *box hint* centred on the point (side = local scale)
+   so that SAM 2 focuses on a small region instead of swallowing the
+   entire swarm.  Each run yields a per-point binary mask and a predicted-
+   IoU confidence score.
+
+3. **Per-point mask fusion**
+   For every annotation point the RGB and depth masks are fused:
+     • If both masks overlap well (IoU ≥ 0.25) their *intersection* is
+       used for a tighter bbox.
+     • If one modality's score clearly dominates (≥ 1.5× the other) that
+       mask is trusted.
+     • If the depth mask is more compact yet reasonably confident (score
+       ≥ 0.8× the RGB score) it is preferred, because depth boundaries
+       tend to be cleaner at object edges.
+     • Otherwise the mask with the higher score is chosen.
+   If neither modality produces a usable mask (< 10 px) a square fallback
+   box sized by the local scale is used.  Every bbox is padded by 10 %,
+   shifted so the annotation centre falls inside, and capped at 50 % of
+   the image dimension.
+
+4. **Duplicate-bbox detection (post-processing)**
+   SAM 2 sometimes maps many swarm points to the *same* large mask,
+   producing near-identical bboxes.  A vectorised N × N pairwise IoU
+   matrix is computed; connected components of bboxes with IoU ≥ 0.70
+   that contain ≥ 3 members are detected via BFS.  For each such group
+   the bboxes are replaced by small squares whose side equals the *median
+   nearest-neighbour distance* among the group's annotation points.
+   Any remaining bbox still exceeding the max-size cap is replaced by a
+   box whose side equals the *median side length across all bboxes in the
+   image*.
+
+5. **GECO2 swarm refinement** (optional, enabled by default)
+   Dense clusters are identified again (same KD-tree connected-component
+   algorithm).  For each cluster that contains oversized SAM 2 bboxes
+   (area > median cluster area × 3):
+     a. Three exemplar bboxes closest to the cluster's median area are
+        picked.  If any exemplar exceeds 1/8 of the image dimension the
+        cluster is skipped (bad exemplars would mislead GECO2).
+     b. GECO2 is run on the full image with those exemplars; the model
+        predicts detection boxes and confidence scores.
+     c. Each predicted box is matched to the nearest annotation point
+        (preferring boxes that contain the point).
+     d. Oversized SAM 2 bboxes are replaced by the GECO2 prediction;
+        non-oversized bboxes are replaced only if GECO2 found a
+        meaningfully tighter box (area < 80 % of SAM 2 area).
 
 Default folder structure (inside IOCfish5kDataset/):
 
@@ -73,7 +136,23 @@ RGBD_IOU_AGREE_THR   = 0.25  # masks with IoU above this are considered agreeing
 RGBD_SCORE_DOMINANCE = 1.5   # one modality dominates if its score is this times higher
 RGBD_DEPTH_COMPACT_W = 0.8   # prefer depth mask if it is smaller and at least this fraction of rgb score
 
+# Dense-cluster and bbox-size-cap settings.
+DENSE_RADIUS_FACTOR = 1.5     # points within median_nn * this factor are "neighbors"
+DENSE_MIN_NEIGHBORS = 3       # need at least this many neighbours to count as dense
+DENSE_SCALE_SHRINK  = 0.45    # in a dense cluster, local scale = nn_dist * this
+MAX_BBOX_FRAC       = 0.5     # bbox may not exceed this fraction of image w / h
+OVERSIZE_FALLBACK   = 0.02    # when bbox exceeds max, replace with this fraction of image dim
+SWARM_OVERSIZE_THR  = 3.0     # bbox area > median_cluster_area * this = "oversized"
+
+# Duplicate-bbox detection settings.
+DUPLICATE_IOU_THR     = 0.70  # IoU above this means "same bbox" (SAM2 swarm failure)
+DUPLICATE_MIN_GROUP   = 3     # min near-identical bboxes to trigger replacement
+
 # GECO2 model settings.
+GECO2_DEFAULT_CKPT = str(
+    SAM2_ROOT / "CNTQG_multitrain_ca44.pth"
+)  # default checkpoint; override with --geco2_checkpoint
+GECO2_MAX_EXEMPLAR_FRAC = 0.125  # 1/8 -- exemplars larger than this are useless for GECO2
 GECO2_IMAGE_SIZE  = 1024
 GECO2_EMB_DIM     = 256
 GECO2_REDUCTION   = 16
@@ -108,6 +187,199 @@ def _fish_scale(points: list[tuple[int, int]], h: int, w: int) -> int:
         d[i] = np.inf
         nn.append(d.min())
     return max(15, int(np.median(nn) * 0.7))
+
+
+def _per_point_local_scale(
+    points: list[tuple[int, int]], h: int, w: int,
+) -> list[int]:
+    """Return a per-point scale that is tighter for points in dense clusters.
+
+    Uses a KD-tree (O(n log n)) to count neighbours within a radius derived
+    from the median nearest-neighbour distance.  Points that have many close
+    neighbours get a smaller scale so that bbox generation is nudged towards
+    smaller boxes.  Isolated points keep the global fish-scale estimate.
+    """
+    from scipy.spatial import cKDTree
+
+    global_scale = _fish_scale(points, h, w)
+    n = len(points)
+    if n <= 2:
+        return [global_scale] * n
+
+    pts = np.array(points, dtype=np.float64)
+    tree = cKDTree(pts)
+
+    # Nearest-neighbour distance per point (k=2 because first hit is itself).
+    nn_dists, _ = tree.query(pts, k=2)
+    nn1 = nn_dists[:, 1]                       # distance to closest other point
+    median_nn = float(np.median(nn1))
+    radius = median_nn * DENSE_RADIUS_FACTOR
+
+    # Count neighbours within the radius for every point.
+    neigh_counts = tree.query_ball_point(pts, radius, return_length=True)
+    # query_ball_point counts the point itself, so subtract 1.
+    neigh_counts = np.asarray(neigh_counts) - 1
+
+    scales: list[int] = []
+    for i in range(n):
+        if neigh_counts[i] >= DENSE_MIN_NEIGHBORS:
+            # Dense cluster: shrink scale based on local nearest-neighbour.
+            local = max(10, int(nn1[i] * DENSE_SCALE_SHRINK))
+            scales.append(local)
+        else:
+            scales.append(global_scale)
+    return scales
+
+
+def _cap_bbox(
+    bx: int, by: int, bw: int, bh: int,
+    cx: int, cy: int, h: int, w: int,
+) -> tuple[int, int, int, int]:
+    """Enforce the maximum bbox size (MAX_BBOX_FRAC of image dims).
+
+    If either dimension exceeds the limit the bbox is replaced by a tiny
+    fallback box (OVERSIZE_FALLBACK of image dim) centred on the point.
+    """
+    max_w = max(1, int(w * MAX_BBOX_FRAC))
+    max_h = max(1, int(h * MAX_BBOX_FRAC))
+    if bw > max_w or bh > max_h:
+        fb_w = max(8, int(w * OVERSIZE_FALLBACK))
+        fb_h = max(8, int(h * OVERSIZE_FALLBACK))
+        bx = max(0, cx - fb_w // 2)
+        by = max(0, cy - fb_h // 2)
+        bw = min(fb_w, w - bx)
+        bh = min(fb_h, h - by)
+    return bx, by, bw, bh
+
+
+def _iou_matrix_xywh(bboxes: np.ndarray) -> np.ndarray:
+    """Vectorized pairwise IoU for N bboxes in (x, y, w, h) format.
+
+    Returns an (N, N) float64 matrix.  Fully numpy-vectorized, no loops.
+    """
+    x1 = bboxes[:, 0].astype(np.float64)
+    y1 = bboxes[:, 1].astype(np.float64)
+    x2 = x1 + bboxes[:, 2]
+    y2 = y1 + bboxes[:, 3]
+    areas = bboxes[:, 2].astype(np.float64) * bboxes[:, 3]
+
+    # Pairwise intersection via broadcasting.
+    ix1 = np.maximum(x1[:, None], x1[None, :])
+    iy1 = np.maximum(y1[:, None], y1[None, :])
+    ix2 = np.minimum(x2[:, None], x2[None, :])
+    iy2 = np.minimum(y2[:, None], y2[None, :])
+    inter = np.maximum(0.0, ix2 - ix1) * np.maximum(0.0, iy2 - iy1)
+
+    union = areas[:, None] + areas[None, :] - inter
+    return np.where(union > 0.0, inter / union, 0.0)
+
+
+def _postprocess_bboxes(
+    points: list[tuple[int, int]],
+    bboxes: list[tuple[int, int, int, int]],
+    scores: list[float],
+    h: int,
+    w: int,
+) -> tuple[list[tuple[int, int, int, int]], list[float]]:
+    """Fix near-duplicate bboxes and cap any remaining oversized ones.
+
+    **Duplicate detection** (vectorized via IoU matrix):
+    SAM 2 often maps many swarm points onto the *same* large mask, producing
+    near-identical bboxes.  Groups of >= DUPLICATE_MIN_GROUP bboxes with
+    pairwise IoU >= DUPLICATE_IOU_THR are detected and replaced with small
+    boxes whose side length equals the *median nearest-neighbour distance*
+    among the points in the group.
+
+    **Oversized cap**:
+    Any remaining bbox larger than MAX_BBOX_FRAC of the image is replaced
+    with a box whose side is the *median side length across all (already
+    fixed) bboxes in the image*.
+    """
+    n = len(bboxes)
+    if n == 0:
+        return bboxes, scores
+
+    bboxes = list(bboxes)
+    scores = list(scores)
+    arr = np.array(bboxes, dtype=np.float64)      # (N, 4)
+    pts = np.array(points, dtype=np.float64)       # (N, 2)
+
+    # ------- Step 1: detect and fix duplicate bboxes in swarms -------
+    if n >= DUPLICATE_MIN_GROUP:
+        iou = _iou_matrix_xywh(arr)
+        np.fill_diagonal(iou, 0.0)
+        adj = iou >= DUPLICATE_IOU_THR              # (N, N) bool
+
+        # Connected components via BFS on the adjacency matrix.
+        visited = np.zeros(n, dtype=bool)
+        dup_groups: list[list[int]] = []
+        for seed in range(n):
+            if visited[seed]:
+                continue
+            # Quick skip: no chance of forming a big-enough group.
+            if adj[seed].sum() < DUPLICATE_MIN_GROUP - 1:
+                visited[seed] = True
+                continue
+            queue = [seed]
+            visited[seed] = True
+            component: list[int] = []
+            while queue:
+                node = queue.pop()
+                component.append(node)
+                nbs = np.flatnonzero(adj[node] & ~visited)
+                visited[nbs] = True
+                queue.extend(nbs.tolist())
+            if len(component) >= DUPLICATE_MIN_GROUP:
+                dup_groups.append(component)
+
+        for group in dup_groups:
+            g_pts = pts[group]                      # (G, 2)
+            g = len(group)
+            # Vectorized pairwise NN distance within the group.
+            if g >= 2:
+                diffs = g_pts[:, None, :] - g_pts[None, :, :]   # (G, G, 2)
+                dists = np.sqrt((diffs * diffs).sum(axis=2))     # (G, G)
+                np.fill_diagonal(dists, np.inf)
+                nn_d = dists.min(axis=1)                         # (G,)
+                side = max(8, int(np.median(nn_d)))
+            else:
+                side = max(8, int((arr[:, 2] + arr[:, 3]).mean() / 2))
+
+            half = side // 2
+            for idx in group:
+                cx, cy = points[idx]
+                cx_c = int(np.clip(cx, 0, w - 1))
+                cy_c = int(np.clip(cy, 0, h - 1))
+                bx = max(0, cx_c - half)
+                by = max(0, cy_c - half)
+                bw = min(side, w - bx)
+                bh = min(side, h - by)
+                bboxes[idx] = (bx, by, bw, bh)
+                # Update the array for step 2.
+                arr[idx] = [bx, by, bw, bh]
+
+    # ------- Step 2: cap remaining oversized bboxes -------
+    # Median side across all bboxes (now including the fixed swarm boxes).
+    all_sides = (arr[:, 2] + arr[:, 3]) / 2.0
+    median_side_global = max(8, int(np.median(all_sides)))
+    max_bw = max(1, int(w * MAX_BBOX_FRAC))
+    max_bh = max(1, int(h * MAX_BBOX_FRAC))
+
+    for i in range(n):
+        bx, by, bw, bh = bboxes[i]
+        if bw > max_bw or bh > max_bh:
+            fb = median_side_global
+            half = fb // 2
+            cx, cy = points[i]
+            cx_c = int(np.clip(cx, 0, w - 1))
+            cy_c = int(np.clip(cy, 0, h - 1))
+            bx = max(0, cx_c - half)
+            by = max(0, cy_c - half)
+            bw = min(fb, w - bx)
+            bh = min(fb, h - by)
+            bboxes[i] = (bx, by, bw, bh)
+
+    return bboxes, scores
 
 
 def _pad_box(bx, by, bw, bh, h, w, frac=BBOX_PAD_FRAC):
@@ -159,6 +431,7 @@ def _sam2_predict_per_point(
     img_bgr: np.ndarray,
     points: list[tuple[int, int]],
     predictor,
+    local_scales: list[int] | None = None,
 ) -> tuple[
     list[tuple[int, int, int, int]],
     list[float],
@@ -167,6 +440,11 @@ def _sam2_predict_per_point(
     """
     Run SAM 2 on each center point and return bboxes, pIoU scores, and masks.
     Masks are None for points where SAM 2 returned a too-small or empty mask.
+
+    If *local_scales* is provided (one int per point), points whose local
+    scale is smaller than the global fish-scale estimate are additionally
+    prompted with a tight box hint so that SAM 2 focuses on a small region
+    instead of swallowing the whole swarm.
     """
     h, w = img_bgr.shape[:2]
     if not points:
@@ -175,20 +453,38 @@ def _sam2_predict_per_point(
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     predictor.set_image(img_rgb)
 
-    scale = _fish_scale(points, h, w)
+    global_scale = _fish_scale(points, h, w)
+    if local_scales is None:
+        local_scales = [global_scale] * len(points)
+
     bboxes: list[tuple[int, int, int, int]] = []
     confidences: list[float] = []
     raw_masks: list[np.ndarray | None] = []
 
-    for cx, cy in points:
+    for idx, (cx, cy) in enumerate(points):
         cx_c = int(np.clip(cx, 0, w - 1))
         cy_c = int(np.clip(cy, 0, h - 1))
+        lscale = local_scales[idx]
 
-        masks, scores, _ = predictor.predict(
+        # Build SAM 2 prompt.  For dense-cluster points, add a box hint
+        # centred on the point so the model doesn't over-segment.
+        predict_kwargs: dict = dict(
             point_coords=np.array([[cx_c, cy_c]], dtype=np.float32),
             point_labels=np.array([1], dtype=np.int32),
             multimask_output=True,
         )
+        if lscale < global_scale:
+            # Provide a tight box prompt around the point to constrain SAM 2.
+            half = lscale
+            bx0 = max(0, cx_c - half)
+            by0 = max(0, cy_c - half)
+            bx1 = min(w - 1, cx_c + half)
+            by1 = min(h - 1, cy_c + half)
+            predict_kwargs["box"] = np.array(
+                [bx0, by0, bx1, by1], dtype=np.float32,
+            )
+
+        masks, scores, _ = predictor.predict(**predict_kwargs)
 
         best_idx = scores.argmax()
         confidence = float(scores[best_idx])
@@ -200,15 +496,16 @@ def _sam2_predict_per_point(
             raw_masks.append(mask.astype(bool))
         else:
             confidence = 0.0
-            half = scale // 2
+            half = lscale // 2
             bx = max(0, cx_c - half)
             by = max(0, cy_c - half)
-            bw = min(scale, w - bx)
-            bh = min(scale, h - by)
+            bw = min(lscale, w - bx)
+            bh = min(lscale, h - by)
             raw_masks.append(None)
 
         bx, by, bw, bh = _pad_box(bx, by, bw, bh, h, w)
         bx, by, bw, bh = _ensure_center_inside(bx, by, bw, bh, cx_c, cy_c, h, w)
+        bx, by, bw, bh = _cap_bbox(bx, by, bw, bh, cx_c, cy_c, h, w)
         bboxes.append((bx, by, bw, bh))
         confidences.append(confidence)
 
@@ -216,13 +513,175 @@ def _sam2_predict_per_point(
     return bboxes, confidences, raw_masks
 
 
+def _find_dense_clusters(
+    points: list[tuple[int, int]], h: int, w: int,
+) -> list[list[int]]:
+    """Return groups of point indices that form dense clusters.
+
+    Each returned list contains the *indices* into *points* that belong to one
+    cluster.  Only clusters with >= DENSE_MIN_NEIGHBORS+1 members are returned.
+    Uses DBSCAN-style connected-component grouping via the KD-tree.
+    """
+    from scipy.spatial import cKDTree
+
+    n = len(points)
+    if n < DENSE_MIN_NEIGHBORS + 1:
+        return []
+
+    pts = np.array(points, dtype=np.float64)
+    tree = cKDTree(pts)
+
+    nn_dists, _ = tree.query(pts, k=2)
+    median_nn = float(np.median(nn_dists[:, 1]))
+    radius = median_nn * DENSE_RADIUS_FACTOR
+
+    # Build adjacency via ball query and extract connected components.
+    neighbours = tree.query_ball_point(pts, radius)
+    visited = [False] * n
+    clusters: list[list[int]] = []
+    for seed in range(n):
+        if visited[seed]:
+            continue
+        # BFS
+        queue = [seed]
+        visited[seed] = True
+        component: list[int] = []
+        while queue:
+            node = queue.pop()
+            component.append(node)
+            for nb in neighbours[node]:
+                if not visited[nb]:
+                    visited[nb] = True
+                    queue.append(nb)
+        if len(component) >= DENSE_MIN_NEIGHBORS + 1:
+            clusters.append(component)
+    return clusters
+
+
+def _pick_median_exemplars(
+    indices: list[int],
+    bboxes: list[tuple[int, int, int, int]],
+    n: int = GECO2_NUM_OBJECTS,
+) -> list[tuple[int, int, int, int]]:
+    """Pick *n* exemplar bboxes whose area is closest to the cluster median."""
+    areas = [(bboxes[i][2] * bboxes[i][3], i) for i in indices]
+    areas.sort()
+    median_area = areas[len(areas) // 2][0]
+    # Sort by distance to median area, take the n closest.
+    by_dist = sorted(areas, key=lambda t: abs(t[0] - median_area))
+    chosen = [bboxes[by_dist[j][1]] for j in range(min(n, len(by_dist)))]
+    while len(chosen) < n:
+        chosen.append(chosen[-1])
+    return chosen
+
+
+def _refine_swarm_with_geco2(
+    img_bgr: np.ndarray,
+    points: list[tuple[int, int]],
+    bboxes: list[tuple[int, int, int, int]],
+    scores: list[float],
+    geco2_model,
+    device: str = "cuda",
+) -> tuple[list[tuple[int, int, int, int]], list[float]]:
+    """Refine bboxes in dense swarms using GECO2.
+
+    For each detected dense cluster:
+      1. Pick 3 median-area bboxes from the cluster as exemplars.
+      2. Run GECO2 on the full image with those exemplars.
+      3. For each cluster point whose SAM2 bbox is oversized relative to
+         the cluster median, replace it with the GECO2 bbox if GECO2
+         produced a valid (non-zero) detection.
+
+    Points outside any dense cluster, or whose SAM2 bbox is already
+    reasonable, are left untouched.
+    """
+    if geco2_model is None or not points:
+        return bboxes, scores
+
+    h, w = img_bgr.shape[:2]
+    clusters = _find_dense_clusters(points, h, w)
+    if not clusters:
+        return bboxes, scores
+
+    bboxes = list(bboxes)   # make mutable copies
+    scores = list(scores)
+
+    for cluster_idx in clusters:
+        # Compute median bbox area in this cluster.
+        areas = [bboxes[i][2] * bboxes[i][3] for i in cluster_idx]
+        median_area = float(np.median(areas))
+
+        # Identify cluster points with oversized bboxes.
+        oversized = [
+            i for i in cluster_idx
+            if bboxes[i][2] * bboxes[i][3] > median_area * SWARM_OVERSIZE_THR
+        ]
+        if not oversized:
+            continue  # all bboxes in this cluster are reasonable
+
+        # Pick 3 median exemplars from the cluster.
+        exemplars = _pick_median_exemplars(cluster_idx, bboxes)
+
+        # Skip GECO2 if exemplars are too large (> 1/8 of image dim).
+        max_ex_w = w * GECO2_MAX_EXEMPLAR_FRAC
+        max_ex_h = h * GECO2_MAX_EXEMPLAR_FRAC
+        if any(ex[2] > max_ex_w or ex[3] > max_ex_h for ex in exemplars):
+            continue
+
+        # Collect all cluster points and run GECO2 on them.
+        cluster_points = [points[i] for i in cluster_idx]
+        geco2_bboxes, geco2_scores = compute_bboxes_geco2(
+            img_bgr, cluster_points, exemplars, geco2_model, device,
+        )
+
+        # Map cluster-local index back to global index.
+        for local_j, global_i in enumerate(cluster_idx):
+            gbx, gby, gbw, gbh = geco2_bboxes[local_j]
+            g_area = gbw * gbh
+            s_area = bboxes[global_i][2] * bboxes[global_i][3]
+
+            # Replace if SAM2 bbox is oversized and GECO2 gave a valid box.
+            if global_i in oversized and g_area > 0:
+                cx, cy = points[global_i]
+                cx_c = int(np.clip(cx, 0, w - 1))
+                cy_c = int(np.clip(cy, 0, h - 1))
+                gbx, gby, gbw, gbh = _cap_bbox(
+                    gbx, gby, gbw, gbh, cx_c, cy_c, h, w,
+                )
+                bboxes[global_i] = (gbx, gby, gbw, gbh)
+                scores[global_i] = geco2_scores[local_j]
+            # Also replace non-oversized points if GECO2 found a tighter box.
+            elif g_area > 0 and g_area < s_area * 0.8:
+                cx, cy = points[global_i]
+                cx_c = int(np.clip(cx, 0, w - 1))
+                cy_c = int(np.clip(cy, 0, h - 1))
+                gbx, gby, gbw, gbh = _cap_bbox(
+                    gbx, gby, gbw, gbh, cx_c, cy_c, h, w,
+                )
+                bboxes[global_i] = (gbx, gby, gbw, gbh)
+                scores[global_i] = geco2_scores[local_j]
+
+    return bboxes, scores
+
+
 def compute_bboxes_sam2(
     img_bgr: np.ndarray,
     points: list[tuple[int, int]],
     predictor,
+    geco2_model=None,
+    device: str = "cuda",
 ) -> tuple[list[tuple[int, int, int, int]], list[float]]:
-    """Run SAM 2 on the RGB image and return (x, y, w, h) bboxes with pIoU scores."""
-    bboxes, confidences, _ = _sam2_predict_per_point(img_bgr, points, predictor)
+    """Run SAM 2 on the RGB image, then refine dense swarms with GECO2."""
+    h, w = img_bgr.shape[:2]
+    local_scales = _per_point_local_scale(points, h, w)
+    bboxes, confidences, _ = _sam2_predict_per_point(
+        img_bgr, points, predictor, local_scales=local_scales,
+    )
+    # Fix duplicate / oversized bboxes before GECO2 sees them.
+    bboxes, confidences = _postprocess_bboxes(points, bboxes, confidences, h, w)
+    bboxes, confidences = _refine_swarm_with_geco2(
+        img_bgr, points, bboxes, confidences, geco2_model, device,
+    )
     return bboxes, confidences
 
 
@@ -312,6 +771,7 @@ def compute_bboxes_watershed(
 
         bx, by, bw, bh = _pad_box(bx, by, bw, bh, h, w)
         bx, by, bw, bh = _ensure_center_inside(bx, by, bw, bh, cx_c, cy_c, h, w)
+        bx, by, bw, bh = _cap_bbox(bx, by, bw, bh, cx_c, cy_c, h, w)
         bboxes.append((bx, by, bw, bh))
 
     return bboxes, [0.0] * len(bboxes)
@@ -424,6 +884,7 @@ def _match_detections_to_points(
             by = max(0, int(y1))
             bw = min(max(1, int(x2 - x1)), w - bx)
             bh = min(max(1, int(y2 - y1)), h - by)
+            bx, by, bw, bh = _cap_bbox(bx, by, bw, bh, cx, cy, h, w)
             result_bboxes.append((bx, by, bw, bh))
             result_scores.append(best_score)
 
@@ -505,7 +966,9 @@ def compute_bboxes_combined(
     if not points:
         return [], []
 
-    sam2_bboxes, sam2_scores = compute_bboxes_sam2(img_bgr, points, sam2_predictor)
+    sam2_bboxes, sam2_scores = compute_bboxes_sam2(
+        img_bgr, points, sam2_predictor,
+    )
 
     # Pick the top-scoring SAM 2 boxes as exemplars for GECO2.
     n_ex = min(GECO2_NUM_OBJECTS, len(sam2_bboxes))
@@ -521,14 +984,20 @@ def compute_bboxes_combined(
         img_bgr, points, exemplars, geco2_model, device,
     )
 
+    h, w = img_bgr.shape[:2]
     final_bboxes: list[tuple[int, int, int, int]] = []
     final_scores: list[float] = []
     for i in range(len(points)):
+        cx, cy = points[i]
+        cx_c = int(np.clip(cx, 0, w - 1))
+        cy_c = int(np.clip(cy, 0, h - 1))
         if geco2_scores[i] > sam2_scores[i]:
-            final_bboxes.append(geco2_bboxes[i])
+            bx, by, bw, bh = _cap_bbox(*geco2_bboxes[i], cx_c, cy_c, h, w)
+            final_bboxes.append((bx, by, bw, bh))
             final_scores.append(geco2_scores[i])
         else:
-            final_bboxes.append(sam2_bboxes[i])
+            bx, by, bw, bh = _cap_bbox(*sam2_bboxes[i], cx_c, cy_c, h, w)
+            final_bboxes.append((bx, by, bw, bh))
             final_scores.append(sam2_scores[i])
 
     return final_bboxes, final_scores
@@ -549,6 +1018,7 @@ def _mask_to_bbox_xywh(
         bh = min(scale, h - by)
     bx, by, bw, bh = _pad_box(bx, by, bw, bh, h, w)
     bx, by, bw, bh = _ensure_center_inside(bx, by, bw, bh, cx, cy, h, w)
+    bx, by, bw, bh = _cap_bbox(bx, by, bw, bh, cx, cy, h, w)
     return bx, by, bw, bh
 
 
@@ -622,6 +1092,7 @@ def _fuse_single_point(
         bh = min(scale, h - by)
         bx, by, bw, bh = _pad_box(bx, by, bw, bh, h, w)
         bx, by, bw, bh = _ensure_center_inside(bx, by, bw, bh, cx, cy, h, w)
+        bx, by, bw, bh = _cap_bbox(bx, by, bw, bh, cx, cy, h, w)
         return (bx, by, bw, bh), 0.0
 
 
@@ -630,10 +1101,13 @@ def compute_bboxes_rgbd(
     depth_bgr: np.ndarray,
     points: list[tuple[int, int]],
     predictor,
+    geco2_model=None,
+    device: str = "cuda",
 ) -> tuple[list[tuple[int, int, int, int]], list[float]]:
     """
     Run SAM 2 on the RGB image and separately on the depth colormap,
     then fuse the resulting masks per annotation point.
+    Dense swarms are further refined with GECO2 when *geco2_model* is provided.
     depth_bgr must be the colorized depth image at the same (or similar) resolution.
     """
     h, w = img_bgr.shape[:2]
@@ -644,11 +1118,12 @@ def compute_bboxes_rgbd(
     if (dh, dw) != (h, w):
         depth_bgr = cv2.resize(depth_bgr, (w, h), interpolation=cv2.INTER_LINEAR)
 
+    local_scales = _per_point_local_scale(points, h, w)
     rgb_bboxes, rgb_scores, rgb_masks = _sam2_predict_per_point(
-        img_bgr, points, predictor,
+        img_bgr, points, predictor, local_scales=local_scales,
     )
     depth_bboxes, depth_scores, depth_masks = _sam2_predict_per_point(
-        depth_bgr, points, predictor,
+        depth_bgr, points, predictor, local_scales=local_scales,
     )
 
     scale = _fish_scale(points, h, w)
@@ -662,11 +1137,18 @@ def compute_bboxes_rgbd(
         bbox, conf = _fuse_single_point(
             rgb_masks[i], rgb_scores[i],
             depth_masks[i], depth_scores[i],
-            cx_c, cy_c, h, w, scale,
+            cx_c, cy_c, h, w, min(scale, local_scales[i]),
         )
         fused_bboxes.append(bbox)
         fused_scores.append(conf)
 
+    # Fix duplicate / oversized bboxes, then refine with GECO2.
+    fused_bboxes, fused_scores = _postprocess_bboxes(
+        points, fused_bboxes, fused_scores, h, w,
+    )
+    fused_bboxes, fused_scores = _refine_swarm_with_geco2(
+        img_bgr, points, fused_bboxes, fused_scores, geco2_model, device,
+    )
     return fused_bboxes, fused_scores
 
 
@@ -779,17 +1261,24 @@ def generate_bbox_xml(
         if depth_img is not None:
             bboxes, scores = compute_bboxes_rgbd(
                 img, depth_img, points, sam2_predictor,
+                geco2_model=geco2_model, device=device,
             )
         else:
             # No depth image found for this frame, fall back to RGB-only SAM 2.
-            bboxes, scores = compute_bboxes_sam2(img, points, sam2_predictor)
+            bboxes, scores = compute_bboxes_sam2(
+                img, points, sam2_predictor,
+                geco2_model=geco2_model, device=device,
+            )
 
     elif method == "combined" and sam2_predictor is not None and geco2_model is not None:
         bboxes, scores = compute_bboxes_combined(
             img, points, sam2_predictor, geco2_model, device,
         )
     elif method == "sam2" and sam2_predictor is not None:
-        bboxes, scores = compute_bboxes_sam2(img, points, sam2_predictor)
+        bboxes, scores = compute_bboxes_sam2(
+            img, points, sam2_predictor,
+            geco2_model=geco2_model, device=device,
+        )
     else:
         bboxes, scores = compute_bboxes_watershed(img, points)
 
@@ -860,8 +1349,17 @@ def main() -> None:
     parser.add_argument(
         "--geco2_checkpoint",
         type=str,
-        default=None,
-        help="Path to GECO2 checkpoint (.pth). Required for the combined method.",
+        default=GECO2_DEFAULT_CKPT,
+        help=(
+            "Path to GECO2 checkpoint (.pth). "
+            f"Default: {GECO2_DEFAULT_CKPT}"
+        ),
+    )
+    parser.add_argument(
+        "--no_geco2",
+        action="store_true",
+        default=False,
+        help="Disable GECO2 swarm refinement (SAM2-only / RGBD-only).",
     )
     parser.add_argument(
         "--img_dir",
@@ -899,7 +1397,32 @@ def main() -> None:
         default=None,
         help="Optional folder for visualization images with drawn bboxes.",
     )
+    parser.add_argument(
+        "--max_bbox_frac",
+        type=float,
+        default=None,
+        help=(
+            "Maximum bbox dimension as a fraction of image size (default: 0.5). "
+            "Bboxes exceeding this are replaced by a tiny fallback box."
+        ),
+    )
+    parser.add_argument(
+        "--dense_min_neighbors",
+        type=int,
+        default=None,
+        help=(
+            "Minimum number of nearby points for a cluster to be considered dense "
+            "(default: 3). Lower values make the dense-cluster logic more aggressive."
+        ),
+    )
     args = parser.parse_args()
+
+    # Override global tuning constants if the user supplied CLI flags.
+    global MAX_BBOX_FRAC, DENSE_MIN_NEIGHBORS
+    if args.max_bbox_frac is not None:
+        MAX_BBOX_FRAC = args.max_bbox_frac
+    if args.dense_min_neighbors is not None:
+        DENSE_MIN_NEIGHBORS = args.dense_min_neighbors
 
     # Resolve input directories.
     img_dir = args.img_dir.resolve() if args.img_dir else IMG_DIR
@@ -930,13 +1453,20 @@ def main() -> None:
 
     if args.method in ("combined", "sam2", "rgbd"):
         # GECO2 must be loaded before SAM 2 to avoid Hydra initialization conflicts.
-        if args.method == "combined":
-            if args.geco2_checkpoint is None:
-                print("Error: --geco2_checkpoint is required for the combined method.")
-                return
-            print("Loading GECO2...")
-            geco2_model = build_geco2_model(args.geco2_checkpoint, device=args.device)
-            print("GECO2 ready.")
+        if not args.no_geco2 and args.geco2_checkpoint is not None:
+            ckpt = Path(args.geco2_checkpoint)
+            if ckpt.is_file():
+                print(f"Loading GECO2 from {ckpt} ...")
+                geco2_model = build_geco2_model(str(ckpt), device=args.device)
+                print("GECO2 ready.")
+            else:
+                print(
+                    f"Warning: GECO2 checkpoint not found at {ckpt}. "
+                    "Swarm refinement with GECO2 will be skipped. "
+                    "Pass --geco2_checkpoint <path> or --no_geco2."
+                )
+        elif args.no_geco2:
+            print("GECO2 swarm refinement disabled (--no_geco2).")
 
         if args.method == "rgbd" and depth_dir is None:
             print(
