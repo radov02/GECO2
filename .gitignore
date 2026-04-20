@@ -115,7 +115,10 @@ IOCfish5kDataset/divided/**
 !IOCfish5kDataset/divided/.gitkeep
 IOCfish5kDataset/.annotation_time.json
 IOCfish5kDataset/my_done_annotated_images/**
-
+IOCfish5kDataset/2300_final_pre-unannotation-filtering/**
+IOCfish5kDataset/2300_finllVersion/**
+IOCfish5kDataset/2300_finllVersion_done/**
+IOCfish5kDataset/2300_finllVersion_undone/**
 # ======================
 # IOCfish5k-D Dataset
 # ======================

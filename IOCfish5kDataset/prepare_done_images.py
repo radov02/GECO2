@@ -57,14 +57,16 @@ def prepare_done_images(folder: Path) -> None:
             print(f"[ERROR] Expected sub-folder not found: {d}", file=sys.stderr)
             sys.exit(1)
 
-    # ── Output folder: <DIVIDED_DIR>/<folder_name>_done ────────────────────
-    out_root  = DIVIDED_DIR / f"{folder.name}_done"
-    out_xml   = out_root / "xml"
-    out_img   = out_root / "images"
-    out_color = out_root / "color"
+    # ── Output folders: *_done and *_undone ────────────────────────────────
+    def _make_out_dirs(suffix: str):
+        root  = DIVIDED_DIR / f"{folder.name}_{suffix}"
+        dirs  = (root / "xml", root / "images", root / "color")
+        for d in dirs:
+            d.mkdir(parents=True, exist_ok=True)
+        return root, *dirs
 
-    for d in (out_xml, out_img, out_color):
-        d.mkdir(parents=True, exist_ok=True)
+    done_root,   done_xml,   done_img,   done_color   = _make_out_dirs("done")
+    undone_root, undone_xml, undone_img, undone_color = _make_out_dirs("undone")
 
     # ── Scan XMLs ──────────────────────────────────────────────────────────
     xml_files = sorted(xml_dir.glob("*.xml"))
@@ -72,37 +74,45 @@ def prepare_done_images(folder: Path) -> None:
         print(f"[WARN] No XML files found in {xml_dir}")
         return
 
-    copied = 0
+    copied_done   = 0
+    copied_undone = 0
     missing = []
 
     for xml_path in xml_files:
-        if not is_done(xml_path):
-            continue
-
+        done = is_done(xml_path)
         img_id = xml_path.stem  # filename without extension
 
         img_src   = img_dir   / f"{img_id}.jpg"
         color_src = color_dir / f"{img_id}.jpg"
 
+        out_xml_dir   = done_xml   if done else undone_xml
+        out_img_dir   = done_img   if done else undone_img
+        out_color_dir = done_color if done else undone_color
+
         # Copy XML
-        shutil.copy2(xml_path, out_xml / xml_path.name)
+        shutil.copy2(xml_path, out_xml_dir / xml_path.name)
 
         # Copy image
         if img_src.exists():
-            shutil.copy2(img_src, out_img / img_src.name)
+            shutil.copy2(img_src, out_img_dir / img_src.name)
         else:
             missing.append(str(img_src))
 
         # Copy depth/colour image
         if color_src.exists():
-            shutil.copy2(color_src, out_color / color_src.name)
+            shutil.copy2(color_src, out_color_dir / color_src.name)
         else:
             missing.append(str(color_src))
 
-        copied += 1
-        print(f"  [OK] {img_id}")
+        if done:
+            copied_done += 1
+            print(f"  [DONE]   {img_id}")
+        else:
+            copied_undone += 1
+            print(f"  [UNDONE] {img_id}")
 
-    print(f"\nDone. Copied {copied} image(s) to: {out_root}")
+    print(f"\nDone.   Copied {copied_done} image(s)   to: {done_root}")
+    print(f"Undone. Copied {copied_undone} image(s) to: {undone_root}")
 
     if missing:
         print(f"\n[WARN] {len(missing)} source file(s) were missing:")

@@ -14,7 +14,7 @@ Default folder structure (inside IOCfish5kDataset/):
     color/    ####_depth.jpg     depth colormaps
     xml/      ####.xml           point-only annotations
 
-  annotated_images/           <-- output
+  auto_annotated_images/           <-- output
     images/   ####.jpg           copied from point_annotations/images/
     color/    ####_depth.jpg     copied from point_annotations/color/
     xml/      ####.xml           new XMLs with bounding boxes
