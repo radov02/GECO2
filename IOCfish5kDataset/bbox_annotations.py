@@ -85,6 +85,46 @@ Default folder structure (inside IOCfish5kDataset/):
 When a bbox XML is written, the corresponding image and depth file
 are copied into annotated_images/ so that inputs and outputs stay
 together. All paths can be overridden via CLI arguments.
+
+Usage examples
+==============
+
+# 1. Default folders (point_annotations/ → auto_annotated_images/):
+python bbox_annotations.py
+
+# 2. Specify a single input root (must contain images/, xml/, color/ sub-folders)
+#    and a single output root (images/, xml/, color/ are created automatically):
+python bbox_annotations.py \
+    --in_dir /path/to/my_input_folder \
+    --out_dir /path/to/my_output_folder
+
+# 3. Specify each input sub-folder individually:
+python bbox_annotations.py \
+    --img_dir /data/rgb_images \
+    --ann_dir /data/xml_annotations \
+    --depth_dir /data/depth_colormaps \
+    --out_dir /data/output
+
+# 4. Use a specific method and generate visualisation images:
+python bbox_annotations.py \
+    --method rgbd \
+    --in_dir /path/to/input \
+    --out_dir /path/to/output \
+    --vis_out_dir /path/to/visualisations
+
+# 5. Disable GECO2 swarm refinement (SAM2/RGBD only):
+python bbox_annotations.py --no_geco2 --in_dir /path/to/input --out_dir /path/to/output
+
+# 6. Use the watershed method (no GPU needed):
+python bbox_annotations.py --method watershed --in_dir /path/to/input --out_dir /path/to/output
+
+# 7. Custom GECO2 checkpoint and tuning parameters:
+python bbox_annotations.py \
+    --geco2_checkpoint /path/to/my_model.pth \
+    --max_bbox_frac 0.4 \
+    --dense_min_neighbors 5 \
+    --in_dir /path/to/input \
+    --out_dir /path/to/output
 """
 
 import argparse
@@ -1362,16 +1402,26 @@ def main() -> None:
         help="Disable GECO2 swarm refinement (SAM2-only / RGBD-only).",
     )
     parser.add_argument(
+        "--in_dir",
+        type=Path,
+        default=None,
+        help=(
+            "Root input folder containing images/, xml/, and color/ sub-folders. "
+            "Overrides --img_dir, --ann_dir, and --depth_dir when specified. "
+            "Default: point_annotations/"
+        ),
+    )
+    parser.add_argument(
         "--img_dir",
         type=Path,
         default=None,
-        help="Input RGB images folder. Default: point_annotations/images/",
+        help="Input RGB images folder. Default: <in_dir>/images/",
     )
     parser.add_argument(
         "--ann_dir",
         type=Path,
         default=None,
-        help="Input point-annotation XMLs folder. Default: point_annotations/xml/",
+        help="Input point-annotation XMLs folder. Default: <in_dir>/xml/",
     )
     parser.add_argument(
         "--depth_dir",
@@ -1379,7 +1429,7 @@ def main() -> None:
         default=None,
         help=(
             "Input depth colormaps folder (<stem>_depth.jpg). "
-            "Default: point_annotations/color/"
+            "Default: <in_dir>/color/"
         ),
     )
     parser.add_argument(
@@ -1387,7 +1437,7 @@ def main() -> None:
         type=Path,
         default=None,
         help=(
-            "Root output folder. Default: annotated_images/. "
+            "Root output folder. Default: auto_annotated_images/. "
             "Sub-folders images/, color/, xml/ are created automatically."
         ),
     )
@@ -1424,13 +1474,22 @@ def main() -> None:
     if args.dense_min_neighbors is not None:
         DENSE_MIN_NEIGHBORS = args.dense_min_neighbors
 
-    # Resolve input directories.
-    img_dir = args.img_dir.resolve() if args.img_dir else IMG_DIR
-    ann_dir = args.ann_dir.resolve() if args.ann_dir else ANN_DIR
+    # Resolve the input root when --in_dir is given.
+    if args.in_dir is not None:
+        in_root = args.in_dir.resolve()
+    else:
+        in_root = IN_DIR  # default: point_annotations/
 
-    # Resolve depth directory: explicit flag > color/ sibling of img_dir > default.
+    # Resolve input directories.  Explicit --img_dir / --ann_dir win over --in_dir.
+    img_dir = args.img_dir.resolve() if args.img_dir else (in_root / "images")
+    ann_dir = args.ann_dir.resolve() if args.ann_dir else (in_root / "xml")
+
+    # Resolve depth directory:
+    #   explicit --depth_dir > <in_root>/color/ > color/ sibling of img_dir > default.
     if args.depth_dir is not None:
         depth_dir: Path | None = args.depth_dir.resolve()
+    elif (in_root / "color").is_dir():
+        depth_dir = in_root / "color"
     elif (img_dir.parent / "color").is_dir():
         depth_dir = img_dir.parent / "color"
     else:
