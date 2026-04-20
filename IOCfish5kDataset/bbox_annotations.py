@@ -136,16 +136,17 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Add the GECO2 root so that local packages (models, configs, …) are importable.
+# Add the GECO2 root so that local packages (models, configs, …) are importable
+# and so that "import sam2" resolves to GECO2/sam2/ (the repo directory whose
+# inner sam2/ sub-package is the actual library).  With GECO2/ on sys.path the
+# import path used in GECO2's own model files  (from sam2.sam2.modeling…)
+# resolves correctly without needing the package installed.
 SAM2_ROOT = Path(__file__).resolve().parent.parent
 if str(SAM2_ROOT) not in sys.path:
     sys.path.insert(0, str(SAM2_ROOT))
 
-# Add the sam2 repo root so that "import sam2" resolves to GECO2/sam2/sam2/.
-# This avoids needing the package to be installed in the active environment.
+# Convenience alias — used for config paths and checkpoint defaults below.
 SAM2_REPO = SAM2_ROOT / "sam2"
-if str(SAM2_REPO) not in sys.path:
-    sys.path.insert(0, str(SAM2_REPO))
 
 # Default paths relative to the dataset folder.
 # Input lives under point_annotations/, output under annotated_images/.
@@ -453,8 +454,8 @@ def build_sam2_predictor(device: str = "cuda"):
     import torch
     from hydra import initialize_config_dir
     from hydra.core.global_hydra import GlobalHydra
-    from sam2.build_sam import build_sam2_hf
-    from sam2.sam2_image_predictor import SAM2ImagePredictor
+    from sam2.sam2.build_sam import build_sam2_hf
+    from sam2.sam2.sam2_image_predictor import SAM2ImagePredictor
 
     if device == "cuda" and not torch.cuda.is_available():
         print("CUDA not available, falling back to CPU (will be slow).")
