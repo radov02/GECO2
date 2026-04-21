@@ -121,6 +121,7 @@ IOCfish5kDataset/2300_finllVersion_done/**
 IOCfish5kDataset/2300_finllVersion_undone/**
 IOCfish5kDataset/_data/**
 IOCfish5kDataset/auto_annotated_images/**
+IOCfish5kDataset/better_annotated/**
 # ======================
 # IOCfish5k-D Dataset
 # ======================

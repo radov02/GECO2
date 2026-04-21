@@ -16,6 +16,16 @@ Controls
   R                          reset zoom to fit
   S                          save annotations
   Q / Escape / Window X      quit (auto-saves)
+
+Use:
+
+python manual_annotations.py
+python manual_annotations.py --fixbboxestocenters ... fix bboxes to centers before GUI/run
+python manual_annotations.py --countpoints ... count remaining center points (shows in GUI)
+python manual_annotations.py --divide N [M] ... copy undone images; N=int (first N) or N=int M=int (1-based inclusive range)
+python manual_annotations.py --usedivided PATH ... use a prebuilt divided folder (expects PATH/xml, PATH/images, PATH/color)
+python manual_annotations.py --donesearch ... copy all XMLs marked <done> to done/ (plus images/depth if present)
+python manual_annotations.py --showdone ... run GUI showing only DONE folder (uses done/ as source)
 """
 
 import cv2

@@ -181,9 +181,10 @@ RGBD_DEPTH_COMPACT_W = 0.8   # prefer depth mask if it is smaller and at least t
 DENSE_RADIUS_FACTOR = 1.5     # points within median_nn * this factor are "neighbors"
 DENSE_MIN_NEIGHBORS = 3       # need at least this many neighbours to count as dense
 DENSE_SCALE_SHRINK  = 0.45    # in a dense cluster, local scale = nn_dist * this
-MAX_BBOX_FRAC       = 0.5     # bbox may not exceed this fraction of image w / h
-OVERSIZE_FALLBACK   = 0.02    # when bbox exceeds max, replace with this fraction of image dim
+MAX_BBOX_FRAC       = 0.95    # bbox may not span (nearly) the full image width/height
+OVERSIZE_FALLBACK   = 0.08    # when bbox spans the full image, replace with this fraction
 SWARM_OVERSIZE_THR  = 3.0     # bbox area > median_cluster_area * this = "oversized"
+MULTIPOINT_SIZE_THR = 1.5     # multipoint bbox replaced only if side > this * typical side
 
 # Duplicate-bbox detection settings.
 DUPLICATE_IOU_THR     = 0.70  # IoU above this means "same bbox" (SAM2 swarm failure)
@@ -222,11 +223,10 @@ def _fish_scale(points: list[tuple[int, int]], h: int, w: int) -> int:
     if len(points) <= 1:
         return min(h, w) // 10
     pts = np.array(points, dtype=np.float32)
-    nn = []
-    for i in range(len(pts)):
-        d = np.linalg.norm(pts - pts[i], axis=1)
-        d[i] = np.inf
-        nn.append(d.min())
+    diff = pts[:, None, :] - pts[None, :, :]        # (N, N, 2)
+    dists = np.sqrt((diff * diff).sum(axis=2))       # (N, N)
+    np.fill_diagonal(dists, np.inf)
+    nn = dists.min(axis=1)
     return max(15, int(np.median(nn) * 0.7))
 
 
@@ -313,6 +313,120 @@ def _iou_matrix_xywh(bboxes: np.ndarray) -> np.ndarray:
 
     union = areas[:, None] + areas[None, :] - inter
     return np.where(union > 0.0, inter / union, 0.0)
+
+
+def _fix_multipoint_bboxes(
+    points: list[tuple[int, int]],
+    bboxes: list[tuple[int, int, int, int]],
+    h: int,
+    w: int,
+) -> list[tuple[int, int, int, int]]:
+    """Collapse bboxes that swallow multiple annotation points into small per-point boxes.
+
+    A bbox is considered "over-grouping" when it contains two or more
+    annotation points *and* is noticeably larger than the typical single-point
+    bbox in the image (side > MULTIPOINT_SIZE_THR * median single-point side).
+    Each over-grouping bbox is replaced by a square centred on its own point,
+    sized by that point's nearest-neighbour distance (capped at the typical
+    single-point side so replacements don't balloon).
+    """
+    n = len(bboxes)
+    if n == 0:
+        return list(bboxes)
+
+    pts_arr = np.array(points, dtype=np.float64)
+    bb_arr = np.array(bboxes, dtype=np.float64)
+
+    x1 = bb_arr[:, 0]
+    y1 = bb_arr[:, 1]
+    x2 = x1 + bb_arr[:, 2]
+    y2 = y1 + bb_arr[:, 3]
+
+    # contains[i, j] = bbox i contains point j
+    px = pts_arr[:, 0]
+    py = pts_arr[:, 1]
+    contains = (
+        (px[None, :] >= x1[:, None]) & (px[None, :] <= x2[:, None])
+        & (py[None, :] >= y1[:, None]) & (py[None, :] <= y2[:, None])
+    )
+    num_contained = contains.sum(axis=1)
+
+    # Reference side: median of bboxes containing exactly one point.
+    single_mask = num_contained <= 1
+    if single_mask.sum() > 0:
+        ref_side = float(np.median(
+            (bb_arr[single_mask, 2] + bb_arr[single_mask, 3]) / 2.0
+        ))
+        ref_side = max(15.0, ref_side)
+    else:
+        ref_side = max(15.0, min(h, w) / 40.0)
+
+    # Per-point NN distance for sizing the replacement boxes.
+    if n > 1:
+        from scipy.spatial import cKDTree
+        tree = cKDTree(pts_arr)
+        nn_d, _ = tree.query(pts_arr, k=2)
+        nn_dists = nn_d[:, 1]
+    else:
+        nn_dists = np.array([ref_side])
+
+    out = list(bboxes)
+    for i in range(n):
+        if num_contained[i] < 2:
+            continue
+        bbox_side = (bb_arr[i, 2] + bb_arr[i, 3]) / 2.0
+        if bbox_side <= ref_side * MULTIPOINT_SIZE_THR:
+            continue  # near-typical size, likely genuine overlap — keep as-is
+        cx, cy = points[i]
+        cx_c = int(np.clip(cx, 0, w - 1))
+        cy_c = int(np.clip(cy, 0, h - 1))
+        side = max(15, int(min(nn_dists[i] * 0.7, ref_side)))
+        half = side // 2
+        bx = max(0, cx_c - half)
+        by = max(0, cy_c - half)
+        bw = min(side, w - bx)
+        bh = min(side, h - by)
+        out[i] = (bx, by, bw, bh)
+    return out
+
+
+def _enforce_point_inside_bbox(
+    points: list[tuple[int, int]],
+    bboxes: list[tuple[int, int, int, int]],
+    h: int,
+    w: int,
+) -> list[tuple[int, int, int, int]]:
+    """Final invariant: guarantee each bbox strictly contains its annotation point.
+
+    Only expands the bbox (never shrinks) so that existing content is preserved
+    while the point is brought inside. Runs last in the pipeline to catch cases
+    where earlier stages (mask fusion, GECO2 matching, etc.) produced a bbox
+    whose point drifted outside.
+    """
+    out: list[tuple[int, int, int, int]] = []
+    for (cx, cy), (bx, by, bw, bh) in zip(points, bboxes):
+        cx_c = int(np.clip(cx, 0, w - 1))
+        cy_c = int(np.clip(cy, 0, h - 1))
+
+        # Extend left/up if point is before the bbox start (keep right/bottom edge).
+        if cx_c < bx:
+            bw += bx - cx_c
+            bx = cx_c
+        if cy_c < by:
+            bh += by - cy_c
+            by = cy_c
+        # Extend right/down if point is at/after the bbox end.
+        if cx_c >= bx + bw:
+            bw = cx_c - bx + 1
+        if cy_c >= by + bh:
+            bh = cy_c - by + 1
+
+        bx = max(0, bx)
+        by = max(0, by)
+        bw = max(1, min(bw, w - bx))
+        bh = max(1, min(bh, h - by))
+        out.append((bx, by, bw, bh))
+    return out
 
 
 def _postprocess_bboxes(
@@ -461,6 +575,9 @@ def build_sam2_predictor(device: str = "cuda"):
         print("CUDA not available, falling back to CPU (will be slow).")
         device = "cpu"
 
+    if device == "cuda":
+        torch.backends.cudnn.benchmark = True
+
     sam2_configs_dir = str(SAM2_ROOT / "sam2" / "sam2_configs")
     GlobalHydra.instance().clear()
     with initialize_config_dir(config_dir=sam2_configs_dir, version_base="1.2"):
@@ -531,9 +648,12 @@ def _sam2_predict_per_point(
         confidence = float(scores[best_idx])
         mask = masks[best_idx]
 
-        coords = cv2.findNonZero(mask.astype(np.uint8))
-        if coords is not None and len(coords) >= SAM2_MIN_MASK_PX:
-            bx, by, bw, bh = cv2.boundingRect(coords)
+        ys, xs = np.nonzero(mask)
+        if len(ys) >= SAM2_MIN_MASK_PX:
+            bx = int(xs.min())
+            by = int(ys.min())
+            bw = int(xs.max()) - bx + 1
+            bh = int(ys.max()) - by + 1
             raw_masks.append(mask.astype(bool))
         else:
             confidence = 0.0
@@ -845,6 +965,8 @@ def build_geco2_model(checkpoint_path: str, device: str = "cuda"):
 
     model = model.to(device)
     model.eval()
+    if device == "cuda":
+        torch.backends.cudnn.benchmark = True
     return model
 
 
@@ -852,20 +974,23 @@ def _preprocess_for_geco2(
     img_bgr: np.ndarray,
     exemplar_bboxes_xyxy: list[tuple[int, int, int, int]],
     image_size: int = GECO2_IMAGE_SIZE,
+    device: str = "cpu",
 ):
     """Resize and pad the image to GECO2 input size, scaling exemplar boxes accordingly.
 
     Returns (img_tensor, exemplar_tensor, scaling_factor, (pad_w, pad_h)).
+    Tensors are placed on *device* so the interpolation and padding run on GPU.
     """
     import torch
 
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    img_t = torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
+    # Move to target device before interpolation so the resize runs on GPU.
+    img_t = torch.from_numpy(img_rgb).permute(2, 0, 1).float().div_(255.0).to(device)
     _, oh, ow = img_t.shape
     longer = max(oh, ow)
     sf = image_size / longer
 
-    ex_t = torch.tensor(exemplar_bboxes_xyxy, dtype=torch.float32)
+    ex_t = torch.tensor(exemplar_bboxes_xyxy, dtype=torch.float32, device=device)
     scaled_ex = ex_t * sf
     a_dim = (
         (scaled_ex[:, 2] - scaled_ex[:, 0]).mean()
@@ -897,37 +1022,34 @@ def _match_detections_to_points(
     result_bboxes: list[tuple[int, int, int, int]] = []
     result_scores: list[float] = []
 
+    no_boxes = len(boxes_xyxy) == 0
+    centres = None if no_boxes else (boxes_xyxy[:, :2] + boxes_xyxy[:, 2:]) / 2
+
     for cx, cy in points:
-        best_idx = -1
-        best_score = -1.0
-
-        if len(boxes_xyxy) > 0:
-            # First try to find the highest-scoring box that contains the point.
-            for i in range(len(boxes_xyxy)):
-                x1, y1, x2, y2 = boxes_xyxy[i]
-                if x1 <= cx <= x2 and y1 <= cy <= y2 and scores[i] > best_score:
-                    best_idx = i
-                    best_score = float(scores[i])
-
-            # If no box contains the point, take the nearest box center.
-            if best_idx == -1:
-                centres = (boxes_xyxy[:, :2] + boxes_xyxy[:, 2:]) / 2
-                dists = np.hypot(centres[:, 0] - cx, centres[:, 1] - cy)
-                best_idx = int(dists.argmin())
-                best_score = float(scores[best_idx])
-
-        if best_idx == -1:
+        if no_boxes:
             result_bboxes.append((0, 0, 0, 0))
             result_scores.append(0.0)
+            continue
+
+        contained = (
+            (boxes_xyxy[:, 0] <= cx) & (cx <= boxes_xyxy[:, 2])
+            & (boxes_xyxy[:, 1] <= cy) & (cy <= boxes_xyxy[:, 3])
+        )
+        if contained.any():
+            best_idx = int(np.where(contained, scores, -np.inf).argmax())
         else:
-            x1, y1, x2, y2 = boxes_xyxy[best_idx]
-            bx = max(0, int(x1))
-            by = max(0, int(y1))
-            bw = min(max(1, int(x2 - x1)), w - bx)
-            bh = min(max(1, int(y2 - y1)), h - by)
-            bx, by, bw, bh = _cap_bbox(bx, by, bw, bh, cx, cy, h, w)
-            result_bboxes.append((bx, by, bw, bh))
-            result_scores.append(best_score)
+            dists = np.hypot(centres[:, 0] - cx, centres[:, 1] - cy)
+            best_idx = int(dists.argmin())
+
+        best_score = float(scores[best_idx])
+        x1, y1, x2, y2 = boxes_xyxy[best_idx]
+        bx = max(0, int(x1))
+        by = max(0, int(y1))
+        bw = min(max(1, int(x2 - x1)), w - bx)
+        bh = min(max(1, int(y2 - y1)), h - by)
+        bx, by, bw, bh = _cap_bbox(bx, by, bw, bh, cx, cy, h, w)
+        result_bboxes.append((bx, by, bw, bh))
+        result_scores.append(best_score)
 
     return result_bboxes, result_scores
 
@@ -955,13 +1077,17 @@ def compute_bboxes_geco2(
     ex_xyxy = [(x, y, x + bw, y + bh) for x, y, bw, bh in exemplar_bboxes_xywh]
 
     img_tensor, ex_tensor, sf, (pad_w, pad_h) = _preprocess_for_geco2(
-        img_bgr, ex_xyxy,
+        img_bgr, ex_xyxy, device=device,
     )
-    img_tensor = img_tensor.unsqueeze(0).to(device)
-    ex_tensor = ex_tensor.unsqueeze(0).to(device)
+    img_tensor = img_tensor.unsqueeze(0)
+    ex_tensor = ex_tensor.unsqueeze(0)
 
     with torch.no_grad():
-        outputs, _ref, _cent, _coord, _masks = geco2_model(img_tensor, ex_tensor)
+        if device == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                outputs, _ref, _cent, _coord, _masks = geco2_model(img_tensor, ex_tensor)
+        else:
+            outputs, _ref, _cent, _coord, _masks = geco2_model(img_tensor, ex_tensor)
 
     # Post-process detections, mirroring the logic in GECO2/inference.py.
     idx = 0
@@ -1048,9 +1174,12 @@ def _mask_to_bbox_xywh(
     mask: np.ndarray, cx: int, cy: int, h: int, w: int, scale: int,
 ) -> tuple[int, int, int, int]:
     """Convert a binary mask to (x, y, w, h). Falls back to a square box if the mask is empty."""
-    coords = cv2.findNonZero(mask.astype(np.uint8))
-    if coords is not None and len(coords) >= SAM2_MIN_MASK_PX:
-        bx, by, bw, bh = cv2.boundingRect(coords)
+    ys, xs = np.nonzero(mask)
+    if len(ys) >= SAM2_MIN_MASK_PX:
+        bx = int(xs.min())
+        by = int(ys.min())
+        bw = int(xs.max()) - bx + 1
+        bh = int(ys.max()) - by + 1
     else:
         half = scale // 2
         bx = max(0, cx - half)
@@ -1061,6 +1190,18 @@ def _mask_to_bbox_xywh(
     bx, by, bw, bh = _ensure_center_inside(bx, by, bw, bh, cx, cy, h, w)
     bx, by, bw, bh = _cap_bbox(bx, by, bw, bh, cx, cy, h, w)
     return bx, by, bw, bh
+
+
+def _mask_bbox_contains_point(
+    mask: np.ndarray | None, cx: int, cy: int,
+) -> bool:
+    """True iff the mask's bounding rect contains the annotation point."""
+    if mask is None:
+        return False
+    ys, xs = np.nonzero(mask)
+    if len(ys) < SAM2_MIN_MASK_PX:
+        return False
+    return int(xs.min()) <= cx <= int(xs.max()) and int(ys.min()) <= cy <= int(ys.max())
 
 
 def _fuse_single_point(
@@ -1077,12 +1218,18 @@ def _fuse_single_point(
     """
     Fuse the RGB and depth SAM 2 masks for one point into a single bbox.
 
-    When both masks are valid:
-      - High IoU means they agree, so we use the intersection (tighter box).
-      - If one score clearly dominates, we trust that modality.
-      - If depth produces a smaller, reasonably confident mask, we prefer it
-        since depth boundaries tend to be cleaner at object edges.
-      - Otherwise we take whichever score is higher.
+    Precedence rules (highest first):
+      0. A mask whose bounding rect contains the annotation point always
+         beats one whose bounding rect does not.  If only one modality's
+         bbox contains the point, that modality is used directly.  The
+         intersection is only used when its own bbox also contains the
+         point (otherwise an intersection could drop the point out).
+      1. High IoU means the two masks agree — use the intersection for a
+         tighter box.
+      2. If one score clearly dominates, trust that modality.
+      3. If depth produces a smaller, reasonably confident mask, prefer it
+         since depth boundaries tend to be cleaner at object edges.
+      4. Otherwise take whichever score is higher.
     If only one mask is valid we use it directly.
     If neither is valid we fall back to a square box sized by fish scale.
     """
@@ -1090,13 +1237,29 @@ def _fuse_single_point(
     depth_ok = depth_mask is not None and depth_mask.sum() >= SAM2_MIN_MASK_PX
 
     if rgb_ok and depth_ok:
+        rgb_has_pt = _mask_bbox_contains_point(rgb_mask, cx, cy)
+        depth_has_pt = _mask_bbox_contains_point(depth_mask, cx, cy)
+
+        # Hard precedence: a mask whose bbox contains the point beats one
+        # whose bbox doesn't.  Only when both or neither contain the point
+        # do we fall through to the score-based fusion below.
+        if rgb_has_pt and not depth_has_pt:
+            return _mask_to_bbox_xywh(rgb_mask, cx, cy, h, w, scale), rgb_score
+        if depth_has_pt and not rgb_has_pt:
+            return _mask_to_bbox_xywh(depth_mask, cx, cy, h, w, scale), depth_score
+
         intersection = rgb_mask & depth_mask
         union = rgb_mask | depth_mask
         union_px = union.sum()
         iou = float(intersection.sum()) / max(float(union_px), 1.0)
 
-        # Both modalities agree on this region, use the intersection for a tighter box.
-        if iou >= RGBD_IOU_AGREE_THR and intersection.sum() >= SAM2_MIN_MASK_PX:
+        # Both modalities agree — use the intersection only if it still
+        # contains the point, otherwise a tighter box would exclude it.
+        if (
+            iou >= RGBD_IOU_AGREE_THR
+            and intersection.sum() >= SAM2_MIN_MASK_PX
+            and _mask_bbox_contains_point(intersection, cx, cy)
+        ):
             conf = max(rgb_score, depth_score) * (0.5 + 0.5 * iou)
             return _mask_to_bbox_xywh(intersection, cx, cy, h, w, scale), conf
 
@@ -1322,6 +1485,13 @@ def generate_bbox_xml(
         )
     else:
         bboxes, scores = compute_bboxes_watershed(img, points)
+
+    # Final fixups (apply to every method):
+    #   1) replace bboxes that swallow multiple annotation points,
+    #   2) guarantee the annotation point lies inside its bbox.
+    h_img, w_img = img.shape[:2]
+    bboxes = _fix_multipoint_bboxes(points, bboxes, h_img, w_img)
+    bboxes = _enforce_point_inside_bbox(points, bboxes, h_img, w_img)
 
     out_dir = xml_out_dir if xml_out_dir is not None else OUT_XML_DIR
     xml_out = out_dir / (img_path.stem + ".xml")
