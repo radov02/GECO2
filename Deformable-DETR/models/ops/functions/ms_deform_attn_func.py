@@ -27,8 +27,16 @@ class MSDeformAttnFunction(Function):
     def forward(ctx, value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, im2col_step):
         if _MSDA_AVAILABLE:
             ctx.im2col_step = im2col_step
+            # CUDA kernel only supports float32; cast if needed
+            input_dtype = value.dtype
+            if input_dtype != torch.float32:
+                value = value.float()
+                sampling_locations = sampling_locations.float()
+                attention_weights = attention_weights.float()
             output = MSDA.ms_deform_attn_forward(
                 value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, ctx.im2col_step)
+            if input_dtype != torch.float32:
+                output = output.to(input_dtype)
             ctx.save_for_backward(value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights)
         else:
             # CPU fallback: use pure PyTorch implementation
