@@ -101,6 +101,12 @@ together. All paths can be overridden via CLI arguments.
 Usage examples
 ==============
 
+tmux new -s mysession
+conda activate geco_310
+CUDA_VISIBLE_DEVICES=1,2 python bbox_annotations.py --num_gpus 2 --method rgbd --in_dir ~/GECO2/IOCfish5kDataset/badly_annotated/auto_annotated_images --out_dir ~/GECO2/IOCfish5kDataset/better_annotated_v3
+tmux attach -t mysession
+
+
 # 1. Default folders (point_annotations/ → auto_annotated_images/):
 python bbox_annotations.py
 
@@ -1654,6 +1660,90 @@ def _copy_if_exists(src: Path, dst: Path) -> bool:
     return True
 
 
+def _run_rank(
+    rank: int,
+    world_size: int,
+    img_files: list,
+    cfg: dict,
+) -> None:
+    """Worker: load models on cuda:{rank} and process img_files[rank::world_size].
+
+    Each spawned process gets a clean Python state, so models are loaded
+    independently on each GPU.  Output directories are shared but each
+    process writes different files, so no locking is needed.
+    """
+    # Apply global overrides forwarded from the main process.
+    global MAX_BBOX_FRAC, DENSE_MIN_NEIGHBORS
+    if cfg["max_bbox_frac"] is not None:
+        MAX_BBOX_FRAC = cfg["max_bbox_frac"]
+    if cfg["dense_min_neighbors"] is not None:
+        DENSE_MIN_NEIGHBORS = cfg["dense_min_neighbors"]
+
+    device = f"cuda:{rank}" if cfg["use_cuda"] else "cpu"
+    img_subset = img_files[rank::world_size]
+
+    prefix = f"[rank {rank}/{world_size}]" if world_size > 1 else ""
+
+    sam2_predictor = None
+    geco2_model = None
+
+    if cfg["method"] in ("combined", "sam2", "rgbd"):
+        geco2_ckpt: str | None = cfg["geco2_ckpt"]
+        if geco2_ckpt is not None:
+            print(f"{prefix} Loading GECO2 on {device} ...", flush=True)
+            geco2_model = build_geco2_model(geco2_ckpt, device=device)
+            print(f"{prefix} GECO2 ready.", flush=True)
+        print(f"{prefix} Loading SAM 2 on {device} ...", flush=True)
+        sam2_predictor = build_sam2_predictor(device=device)
+        print(f"{prefix} SAM 2 ready.", flush=True)
+
+        if cfg["method"] == "rgbd" and cfg["depth_dir"] is None:
+            print(
+                f"{prefix} Warning: no depth folder found. "
+                "Falling back to RGB-only SAM 2.",
+                flush=True,
+            )
+
+    ann_dir: "Path" = cfg["ann_dir"]
+    xml_out_dir: "Path" = cfg["xml_out_dir"]
+    out_img_dir: "Path" = cfg["out_img_dir"]
+    out_depth_dir: "Path" = cfg["out_depth_dir"]
+    depth_dir: "Path | None" = cfg["depth_dir"]
+
+    skipped = processed = 0
+    for img_path in img_subset:
+        ann_xml = ann_dir / (img_path.stem + ".xml")
+        if not ann_xml.exists():
+            skipped += 1
+            continue
+
+        count = generate_bbox_xml(
+            img_path, ann_xml,
+            method=cfg["method"],
+            sam2_predictor=sam2_predictor,
+            geco2_model=geco2_model,
+            device=device,
+            depth_dir=depth_dir,
+            xml_out_dir=xml_out_dir,
+        )
+        if count == 0:
+            continue
+
+        _copy_if_exists(img_path, out_img_dir / img_path.name)
+        if depth_dir is not None:
+            _dn1 = img_path.stem + "_depth.jpg"
+            _dn2 = img_path.stem + ".jpg"
+            depth_name = _dn1 if (depth_dir / _dn1).exists() else _dn2
+            _copy_if_exists(depth_dir / depth_name, out_depth_dir / depth_name)
+
+        processed += 1
+        print(f"  {prefix} {img_path.name}: {count} bboxes", flush=True)
+
+    if skipped:
+        print(f"  {prefix} Skipped {skipped} image(s) with no annotation file.", flush=True)
+    print(f"  {prefix} Done: {processed} image(s).", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Estimate bboxes from point annotations.",
@@ -1758,6 +1848,16 @@ def main() -> None:
             "(default: 3). Lower values make the dense-cluster logic more aggressive."
         ),
     )
+    parser.add_argument(
+        "--num_gpus",
+        type=int,
+        default=0,
+        help=(
+            "Number of GPUs to use for parallel processing (default: 0 = all available). "
+            "Each GPU runs its own SAM 2 / GECO2 instance and processes a disjoint "
+            "subset of images.  Set to 1 to disable multi-GPU even when more are present."
+        ),
+    )
     args = parser.parse_args()
 
     # Override global tuning constants if the user supplied CLI flags.
@@ -1800,82 +1900,85 @@ def main() -> None:
         print(f"No .jpg files found in {img_dir}")
         return
 
-    sam2_predictor = None
-    geco2_model = None
-
-    if args.method in ("combined", "sam2", "rgbd"):
-        # GECO2 must be loaded before SAM 2 to avoid Hydra initialization conflicts.
-        if not args.no_geco2 and args.geco2_checkpoint is not None:
+    # Resolve GECO2 checkpoint once so all workers use the same path.
+    geco2_ckpt: str | None = None
+    if args.method in ("combined", "sam2", "rgbd") and not args.no_geco2:
+        if args.geco2_checkpoint is not None:
             ckpt = Path(args.geco2_checkpoint)
             if ckpt.is_file():
-                print(f"Loading GECO2 from {ckpt} ...")
-                geco2_model = build_geco2_model(str(ckpt), device=args.device)
-                print("GECO2 ready.")
+                geco2_ckpt = str(ckpt)
             else:
                 print(
                     f"Warning: GECO2 checkpoint not found at {ckpt}. "
                     "Swarm refinement with GECO2 will be skipped. "
                     "Pass --geco2_checkpoint <path> or --no_geco2."
                 )
-        elif args.no_geco2:
-            print("GECO2 swarm refinement disabled (--no_geco2).")
-
-        if args.method == "rgbd" and depth_dir is None:
-            print(
-                "Warning: no depth folder found. "
-                "Pass --depth_dir or place depth images in point_annotations/color/. "
-                "Will fall back to RGB-only SAM 2 for every image."
-            )
-
-        print("Loading SAM 2...")
-        sam2_predictor = build_sam2_predictor(device=args.device)
-        print("SAM 2 ready.")
+    elif args.no_geco2:
+        print("GECO2 swarm refinement disabled (--no_geco2).")
 
     n_depth = 0
     if depth_dir is not None:
         n_depth = len(list(depth_dir.glob("*.jpg")))
 
-    print(f"Found {len(img_files)} images, {n_depth} depth maps. Method: {args.method}.")
+    # Determine how many GPUs to use.
+    import torch
+    n_cuda = torch.cuda.device_count() if args.device != "cpu" else 0
+    use_cuda = n_cuda > 0 and args.device != "cpu"
 
-    # Ensure output sub-folders exist.
+    if args.num_gpus > 0:
+        world_size = min(args.num_gpus, max(1, n_cuda))
+        if world_size < args.num_gpus:
+            print(
+                f"Warning: requested {args.num_gpus} GPUs but only {n_cuda} "
+                f"available — using {world_size}."
+            )
+    else:
+        world_size = max(1, n_cuda)
+
+    # Force single-process when CUDA is unavailable or method needs no GPU.
+    if not use_cuda:
+        world_size = 1
+
+    print(
+        f"Found {len(img_files)} images, {n_depth} depth maps. "
+        f"Method: {args.method}. "
+        f"GPUs: {world_size if use_cuda else 0} "
+        f"({'multi-GPU' if world_size > 1 else 'single-process'})."
+    )
+
+    # Ensure output sub-folders exist before workers start writing.
     for d in (xml_out_dir, out_img_dir, out_depth_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     print(f"Writing bbox XMLs to {xml_out_dir}")
-    skipped = 0
-    processed = 0
-    for img_path in img_files:
-        ann_xml = ann_dir / (img_path.stem + ".xml")
-        if not ann_xml.exists():
-            skipped += 1
-            continue
 
-        count = generate_bbox_xml(
-            img_path, ann_xml,
-            method=args.method,
-            sam2_predictor=sam2_predictor,
-            geco2_model=geco2_model,
-            device=args.device,
-            depth_dir=depth_dir,
-            xml_out_dir=xml_out_dir,
+    cfg = dict(
+        method=args.method,
+        ann_dir=ann_dir,
+        depth_dir=depth_dir,
+        xml_out_dir=xml_out_dir,
+        out_img_dir=out_img_dir,
+        out_depth_dir=out_depth_dir,
+        geco2_ckpt=geco2_ckpt,
+        use_cuda=use_cuda,
+        max_bbox_frac=args.max_bbox_frac,
+        dense_min_neighbors=args.dense_min_neighbors,
+    )
+
+    if world_size > 1:
+        import torch.multiprocessing as mp
+        # "spawn" gives each worker a clean Python state so Hydra and CUDA
+        # initialise independently without conflicts.
+        mp.spawn(
+            _run_rank,
+            args=(world_size, img_files, cfg),
+            nprocs=world_size,
+            join=True,
         )
-        if count == 0:
-            continue
+    else:
+        _run_rank(0, 1, img_files, cfg)
 
-        # Copy the source image and depth colormap alongside the new XML.
-        _copy_if_exists(img_path, out_img_dir / img_path.name)
-        if depth_dir is not None:
-            _dn1 = img_path.stem + "_depth.jpg"
-            _dn2 = img_path.stem + ".jpg"
-            depth_name = _dn1 if (depth_dir / _dn1).exists() else _dn2
-            _copy_if_exists(depth_dir / depth_name, out_depth_dir / depth_name)
-
-        processed += 1
-        print(f"  {img_path.name}: {count} bboxes", flush=True)
-
-    if skipped:
-        print(f"  Skipped {skipped} image(s) with no matching annotation file.")
-    print(f"Processed {processed} image(s). Output in {out_root}")
+    print(f"All workers finished. Output in {out_root}")
 
     # Optional: draw bboxes on images for visual inspection.
     if vis_out_dir is not None:
