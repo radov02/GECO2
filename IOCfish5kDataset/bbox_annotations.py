@@ -1679,6 +1679,14 @@ def _run_rank(
     if cfg["dense_min_neighbors"] is not None:
         DENSE_MIN_NEIGHBORS = cfg["dense_min_neighbors"]
 
+    # Pin this process to its GPU *before* any CUDA operation.
+    # Without this, every spawned process defaults to cuda:0 for internal
+    # allocations (e.g. model buffers), even when tensors are explicitly
+    # moved to cuda:1 — causing illegal memory access errors on rank ≥ 1.
+    if cfg["use_cuda"]:
+        import torch
+        torch.cuda.set_device(rank)
+
     device = f"cuda:{rank}" if cfg["use_cuda"] else "cpu"
     img_subset = img_files[rank::world_size]
 
