@@ -23,25 +23,37 @@ RGBD method — step-by-step pipeline
 2. **Dual SAM 2 inference (RGB + depth)**
    SAM 2 (facebook/sam2-hiera-base-plus) is run *twice* — once on the
    original RGB image and once on the colourised depth map — using single-
-   point prompts.  For dense-cluster points the prompt additionally
+   point prompts.  For dense-cluster points the RGB prompt additionally
    includes a tight *box hint* centred on the point (side = local scale)
    so that SAM 2 focuses on a small region instead of swallowing the
-   entire swarm.  Each run yields a per-point binary mask and a predicted-
-   IoU confidence score.
+   entire swarm.  The **depth** run is always un-hinted, because depth
+   maps naturally separate objects by distance: a tight hint there would
+   artificially shrink the mask of a large object (turtle, shark, big
+   fish) whose annotation point happens to sit inside a dense cluster of
+   smaller neighbours.  Each run yields a per-point binary mask and a
+   predicted-IoU confidence score.
 
-3. **Per-point mask fusion**
-   For every annotation point the RGB and depth masks are fused:
-     • If both masks overlap well (IoU ≥ 0.25) their *intersection* is
-       used for a tighter bbox.
-     • If one modality's score clearly dominates (≥ 1.5× the other) that
-       mask is trusted.
-     • If the depth mask is more compact yet reasonably confident (score
-       ≥ 0.8× the RGB score) it is preferred, because depth boundaries
-       tend to be cleaner at object edges.
-     • Otherwise the mask with the higher score is chosen.
+3. **Per-point mask fusion (centring-first)**
+   For every annotation point the RGB and depth masks are fused with the
+   following precedence:
+     1. **Containment** — a mask whose bbox contains the point wins over
+        one that doesn't.
+     2. **Hint override** — if RGB was box-hinted and the un-hinted depth
+        mask is noticeably larger *and* still reasonably centred on the
+        point, depth wins (rescues large objects that RGB's hint cut off).
+     3. **Centring** — otherwise the mask on which the point is closer to
+        the bbox centre wins.  A minimum margin (RGBD_CENTERING_DIFF) is
+        required to unseat the other modality; if both are well centred,
+        RGB wins.
+     4. **Intersection** — if the two masks agree well (IoU ≥ 0.25) and
+        the intersection still contains the point, use the intersection
+        for a tighter box.
+     5. **Score/compactness fall-through** — score dominance (≥ 1.5×),
+        then "depth more compact at ≥ 0.8× RGB score", then the higher
+        score outright (ties to RGB).
    If neither modality produces a usable mask (< 10 px) a square fallback
    box sized by the local scale is used.  Every bbox is padded by 10 %,
-   shifted so the annotation centre falls inside, and capped at 50 % of
+   shifted so the annotation centre falls inside, and capped at 95 % of
    the image dimension.
 
 4. **Duplicate-bbox detection (post-processing)**
@@ -176,15 +188,19 @@ SAM2_MIN_MASK_PX  = 10   # masks smaller than this are treated as failures
 RGBD_IOU_AGREE_THR   = 0.25  # masks with IoU above this are considered agreeing
 RGBD_SCORE_DOMINANCE = 1.5   # one modality dominates if its score is this times higher
 RGBD_DEPTH_COMPACT_W = 0.8   # prefer depth mask if it is smaller and at least this fraction of rgb score
+RGBD_CENTERING_GOOD  = 0.5   # point within half the bbox radius of centre counts as "well-centred"
+RGBD_CENTERING_DIFF  = 0.20  # one modality must beat the other's centring by this much to win
 
 # Dense-cluster and bbox-size-cap settings.
 DENSE_RADIUS_FACTOR = 1.5     # points within median_nn * this factor are "neighbors"
 DENSE_MIN_NEIGHBORS = 3       # need at least this many neighbours to count as dense
 DENSE_SCALE_SHRINK  = 0.45    # in a dense cluster, local scale = nn_dist * this
 MAX_BBOX_FRAC       = 0.95    # bbox may not span (nearly) the full image width/height
-OVERSIZE_FALLBACK   = 0.08    # when bbox spans the full image, replace with this fraction
+OVERSIZE_FALLBACK   = 0.15    # when bbox spans the full image, replace with this fraction
 SWARM_OVERSIZE_THR  = 3.0     # bbox area > median_cluster_area * this = "oversized"
-MULTIPOINT_SIZE_THR = 1.5     # multipoint bbox replaced only if side > this * typical side
+MULTIPOINT_SIZE_THR = 3.0     # multipoint bbox replaced only if side > this * typical side
+MULTIPOINT_MIN_PTS  = 3       # ... and only if it contains at least this many points
+MULTIPOINT_OWN_CENTRED = 0.4  # ... and only if its own point is NOT this well-centred
 
 # Duplicate-bbox detection settings.
 DUPLICATE_IOU_THR     = 0.70  # IoU above this means "same bbox" (SAM2 swarm failure)
@@ -323,12 +339,19 @@ def _fix_multipoint_bboxes(
 ) -> list[tuple[int, int, int, int]]:
     """Collapse bboxes that swallow multiple annotation points into small per-point boxes.
 
-    A bbox is considered "over-grouping" when it contains two or more
-    annotation points *and* is noticeably larger than the typical single-point
-    bbox in the image (side > MULTIPOINT_SIZE_THR * median single-point side).
-    Each over-grouping bbox is replaced by a square centred on its own point,
-    sized by that point's nearest-neighbour distance (capped at the typical
-    single-point side so replacements don't balloon).
+    A bbox is considered "over-grouping" when it contains >=
+    MULTIPOINT_MIN_PTS annotation points *and* is noticeably larger than the
+    typical single-point bbox in the image (side > MULTIPOINT_SIZE_THR *
+    median single-point side).  Even then, a bbox whose *own* point is
+    well-centred (centring ratio <= MULTIPOINT_OWN_CENTRED) is left alone —
+    a well-centred own point is strong evidence that the bbox legitimately
+    belongs to a large object (e.g. a shark) that happens to overlap a few
+    smaller fish annotations.
+
+    Each over-grouping bbox that still passes all the checks is replaced by
+    a square centred on its own point, sized by that point's nearest-
+    neighbour distance (capped at the typical single-point side so
+    replacements don't balloon).
     """
     n = len(bboxes)
     if n == 0:
@@ -372,11 +395,22 @@ def _fix_multipoint_bboxes(
 
     out = list(bboxes)
     for i in range(n):
-        if num_contained[i] < 2:
+        if num_contained[i] < MULTIPOINT_MIN_PTS:
             continue
         bbox_side = (bb_arr[i, 2] + bb_arr[i, 3]) / 2.0
         if bbox_side <= ref_side * MULTIPOINT_SIZE_THR:
             continue  # near-typical size, likely genuine overlap — keep as-is
+        # Keep the bbox if its own annotation point is well-centred in it:
+        # that's strong evidence the bbox is a legitimate large-object
+        # detection and the contained extra points are just neighbouring
+        # fish that happen to lie on top of the big object.
+        own_ratio = _bbox_centering(
+            (int(bb_arr[i, 0]), int(bb_arr[i, 1]),
+             int(bb_arr[i, 2]), int(bb_arr[i, 3])),
+            int(points[i][0]), int(points[i][1]),
+        )
+        if own_ratio <= MULTIPOINT_OWN_CENTRED:
+            continue
         cx, cy = points[i]
         cx_c = int(np.clip(cx, 0, w - 1))
         cy_c = int(np.clip(cy, 0, h - 1))
@@ -590,6 +624,7 @@ def _sam2_predict_per_point(
     points: list[tuple[int, int]],
     predictor,
     local_scales: list[int] | None = None,
+    use_box_hint: bool = True,
 ) -> tuple[
     list[tuple[int, int, int, int]],
     list[float],
@@ -602,7 +637,11 @@ def _sam2_predict_per_point(
     If *local_scales* is provided (one int per point), points whose local
     scale is smaller than the global fish-scale estimate are additionally
     prompted with a tight box hint so that SAM 2 focuses on a small region
-    instead of swallowing the whole swarm.
+    instead of swallowing the whole swarm.  Set *use_box_hint* to False to
+    skip the hint entirely — useful on depth colormaps where large objects
+    are already easy to segment and the hint would artificially shrink the
+    mask of any large object whose annotation point happens to sit near
+    smaller neighbours.
     """
     h, w = img_bgr.shape[:2]
     if not points:
@@ -631,7 +670,7 @@ def _sam2_predict_per_point(
             point_labels=np.array([1], dtype=np.int32),
             multimask_output=True,
         )
-        if lscale < global_scale:
+        if use_box_hint and lscale < global_scale:
             # Provide a tight box prompt around the point to constrain SAM 2.
             half = lscale
             bx0 = max(0, cx_c - half)
@@ -1192,6 +1231,49 @@ def _mask_to_bbox_xywh(
     return bx, by, bw, bh
 
 
+def _mask_bbox_centering(
+    mask: np.ndarray | None, cx: int, cy: int,
+) -> float:
+    """Return how far the annotation point is from the mask-bbox centre.
+
+    The value is normalised by the bbox half-size, so:
+      * 0.0  = perfectly centred,
+      * ~1.0 = at the bbox edge,
+      * >1.0 = the point lies outside the bbox altogether,
+      * inf  = mask is missing or too small to trust.
+    """
+    if mask is None:
+        return float("inf")
+    ys, xs = np.nonzero(mask)
+    if len(ys) < SAM2_MIN_MASK_PX:
+        return float("inf")
+    xmin, xmax = float(xs.min()), float(xs.max())
+    ymin, ymax = float(ys.min()), float(ys.max())
+    cx_box = (xmin + xmax) / 2.0
+    cy_box = (ymin + ymax) / 2.0
+    half_w = max(1.0, (xmax - xmin) / 2.0)
+    half_h = max(1.0, (ymax - ymin) / 2.0)
+    dx = (float(cx) - cx_box) / half_w
+    dy = (float(cy) - cy_box) / half_h
+    return float((dx * dx + dy * dy) ** 0.5)
+
+
+def _bbox_centering(
+    bbox: tuple[int, int, int, int], cx: int, cy: int,
+) -> float:
+    """Same as :func:`_mask_bbox_centering` but directly from an (x, y, w, h) box."""
+    bx, by, bw, bh = bbox
+    if bw <= 0 or bh <= 0:
+        return float("inf")
+    cx_box = bx + bw / 2.0
+    cy_box = by + bh / 2.0
+    half_w = max(1.0, bw / 2.0)
+    half_h = max(1.0, bh / 2.0)
+    dx = (float(cx) - cx_box) / half_w
+    dy = (float(cy) - cy_box) / half_h
+    return float((dx * dx + dy * dy) ** 0.5)
+
+
 def _mask_bbox_contains_point(
     mask: np.ndarray | None, cx: int, cy: int,
 ) -> bool:
@@ -1214,22 +1296,29 @@ def _fuse_single_point(
     h: int,
     w: int,
     scale: int,
+    rgb_was_hinted: bool = False,
 ) -> tuple[tuple[int, int, int, int], float]:
     """
     Fuse the RGB and depth SAM 2 masks for one point into a single bbox.
 
     Precedence rules (highest first):
-      0. A mask whose bounding rect contains the annotation point always
-         beats one whose bounding rect does not.  If only one modality's
-         bbox contains the point, that modality is used directly.  The
-         intersection is only used when its own bbox also contains the
-         point (otherwise an intersection could drop the point out).
-      1. High IoU means the two masks agree — use the intersection for a
-         tighter box.
-      2. If one score clearly dominates, trust that modality.
-      3. If depth produces a smaller, reasonably confident mask, prefer it
-         since depth boundaries tend to be cleaner at object edges.
-      4. Otherwise take whichever score is higher.
+      0. Containment — a mask whose bounding rect contains the annotation
+         point beats one whose bounding rect does not.
+      1. Hint override — when the RGB run was given a tight box-hint (dense
+         cluster point) the RGB mask is an artificial lower bound.  If the
+         un-hinted depth mask contains the point, is reasonably well-centred
+         on it, and is larger than the RGB mask, trust depth — it likely
+         found a large object that the RGB hint cut off (e.g. a turtle
+         swimming amongst small fish).
+      2. Centering — of the masks that contain the point, prefer the one
+         whose bbox is better centred on the annotation point.  A
+         RGBD_CENTERING_DIFF margin is required to unseat the other
+         modality; if both are well-centred within the tolerance, RGB wins.
+      3. Intersection — if the two masks agree (IoU >= RGBD_IOU_AGREE_THR)
+         and the intersection still contains the point, use the intersection
+         for a tighter box.
+      4. Score dominance / depth compactness / higher-score fall-through
+         (as in previous versions).
     If only one mask is valid we use it directly.
     If neither is valid we fall back to a square box sized by fish scale.
     """
@@ -1237,24 +1326,43 @@ def _fuse_single_point(
     depth_ok = depth_mask is not None and depth_mask.sum() >= SAM2_MIN_MASK_PX
 
     if rgb_ok and depth_ok:
-        rgb_has_pt = _mask_bbox_contains_point(rgb_mask, cx, cy)
-        depth_has_pt = _mask_bbox_contains_point(depth_mask, cx, cy)
+        rgb_center = _mask_bbox_centering(rgb_mask, cx, cy)
+        depth_center = _mask_bbox_centering(depth_mask, cx, cy)
+        rgb_has_pt = rgb_center < 1.0
+        depth_has_pt = depth_center < 1.0
 
-        # Hard precedence: a mask whose bbox contains the point beats one
-        # whose bbox doesn't.  Only when both or neither contain the point
-        # do we fall through to the score-based fusion below.
+        # 0. Containment wins outright when only one modality contains the point.
         if rgb_has_pt and not depth_has_pt:
             return _mask_to_bbox_xywh(rgb_mask, cx, cy, h, w, scale), rgb_score
         if depth_has_pt and not rgb_has_pt:
             return _mask_to_bbox_xywh(depth_mask, cx, cy, h, w, scale), depth_score
 
+        if rgb_has_pt and depth_has_pt:
+            # 1. Hint override: an un-hinted depth mask that is clearly
+            # larger and reasonably centred on the point overrules a
+            # hint-tightened RGB bbox.  This rescues large objects
+            # (turtle, big fish) whose point happens to sit in a dense
+            # cluster and would otherwise get a matchbox-sized bbox.
+            if rgb_was_hinted:
+                rgb_area = float(rgb_mask.sum())
+                depth_area = float(depth_mask.sum())
+                if depth_area > rgb_area * 1.5 and depth_center <= RGBD_CENTERING_GOOD:
+                    return _mask_to_bbox_xywh(depth_mask, cx, cy, h, w, scale), depth_score
+
+            # 2. Centering-first comparison.
+            if depth_center + RGBD_CENTERING_DIFF < rgb_center:
+                return _mask_to_bbox_xywh(depth_mask, cx, cy, h, w, scale), depth_score
+            if rgb_center + RGBD_CENTERING_DIFF < depth_center:
+                return _mask_to_bbox_xywh(rgb_mask, cx, cy, h, w, scale), rgb_score
+            if rgb_center <= RGBD_CENTERING_GOOD and depth_center <= RGBD_CENTERING_GOOD:
+                # Both well-centred within the tolerance — prefer RGB.
+                return _mask_to_bbox_xywh(rgb_mask, cx, cy, h, w, scale), rgb_score
+
+        # 3. Intersection for agreeing masks.
         intersection = rgb_mask & depth_mask
         union = rgb_mask | depth_mask
         union_px = union.sum()
         iou = float(intersection.sum()) / max(float(union_px), 1.0)
-
-        # Both modalities agree — use the intersection only if it still
-        # contains the point, otherwise a tighter box would exclude it.
         if (
             iou >= RGBD_IOU_AGREE_THR
             and intersection.sum() >= SAM2_MIN_MASK_PX
@@ -1263,23 +1371,22 @@ def _fuse_single_point(
             conf = max(rgb_score, depth_score) * (0.5 + 0.5 * iou)
             return _mask_to_bbox_xywh(intersection, cx, cy, h, w, scale), conf
 
-        # One modality is much more confident, trust it.
+        # 4a. One modality is much more confident, trust it.
         if rgb_score > depth_score * RGBD_SCORE_DOMINANCE:
             return _mask_to_bbox_xywh(rgb_mask, cx, cy, h, w, scale), rgb_score
         if depth_score > rgb_score * RGBD_SCORE_DOMINANCE:
             return _mask_to_bbox_xywh(depth_mask, cx, cy, h, w, scale), depth_score
 
-        # Depth mask is more compact and reasonably confident, prefer it.
+        # 4b. Depth mask is more compact and reasonably confident, prefer it.
         rgb_area = float(rgb_mask.sum())
         depth_area = float(depth_mask.sum())
         if depth_area < rgb_area and depth_score >= rgb_score * RGBD_DEPTH_COMPACT_W:
             return _mask_to_bbox_xywh(depth_mask, cx, cy, h, w, scale), depth_score
 
-        # No strong preference, just use the higher score.
+        # 4c. No strong preference — higher score, ties to RGB.
         if rgb_score >= depth_score:
             return _mask_to_bbox_xywh(rgb_mask, cx, cy, h, w, scale), rgb_score
-        else:
-            return _mask_to_bbox_xywh(depth_mask, cx, cy, h, w, scale), depth_score
+        return _mask_to_bbox_xywh(depth_mask, cx, cy, h, w, scale), depth_score
 
     elif rgb_ok:
         return _mask_to_bbox_xywh(rgb_mask, cx, cy, h, w, scale), rgb_score
@@ -1323,14 +1430,28 @@ def compute_bboxes_rgbd(
         depth_bgr = cv2.resize(depth_bgr, (w, h), interpolation=cv2.INTER_LINEAR)
 
     local_scales = _per_point_local_scale(points, h, w)
+    global_scale = _fish_scale(points, h, w)
+    # A point receives the tight box hint on the RGB run iff its local scale
+    # was shrunk below the global fish-scale estimate.  The fusion step uses
+    # this flag to know when RGB was "artificially constrained" so it can
+    # defer to the un-hinted depth mask for genuinely large objects.
+    rgb_hinted = [ls < global_scale for ls in local_scales]
+
     rgb_bboxes, rgb_scores, rgb_masks = _sam2_predict_per_point(
-        img_bgr, points, predictor, local_scales=local_scales,
+        img_bgr, points, predictor,
+        local_scales=local_scales, use_box_hint=True,
     )
+    # Depth runs WITHOUT the hint so large objects whose annotation point
+    # happens to sit in a dense cluster still get segmented correctly.
+    # Depth boundaries are usually clean enough that over-segmentation of
+    # swarms is rare; when it does happen, the fusion step filters it out
+    # via the point-centring check.
     depth_bboxes, depth_scores, depth_masks = _sam2_predict_per_point(
-        depth_bgr, points, predictor, local_scales=local_scales,
+        depth_bgr, points, predictor,
+        local_scales=local_scales, use_box_hint=False,
     )
 
-    scale = _fish_scale(points, h, w)
+    scale = global_scale
     fused_bboxes: list[tuple[int, int, int, int]] = []
     fused_scores: list[float] = []
 
@@ -1342,6 +1463,7 @@ def compute_bboxes_rgbd(
             rgb_masks[i], rgb_scores[i],
             depth_masks[i], depth_scores[i],
             cx_c, cy_c, h, w, min(scale, local_scales[i]),
+            rgb_was_hinted=rgb_hinted[i],
         )
         fused_bboxes.append(bbox)
         fused_scores.append(conf)

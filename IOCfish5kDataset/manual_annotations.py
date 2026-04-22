@@ -66,24 +66,33 @@ KEY_LEFT  = 2424832
 KEY_RIGHT = 2555904
 KEY_F11   = 0x7A0000  # VK_F11 << 16
 
-# ── Windows API for modifier key detection ─────────────────────────────────────
-VK_CONTROL = 0x11
-VK_SHIFT   = 0x10
+# ── Modifier key detection (cross-platform) ─────────────────────────────────────
+import platform as _platform
 
-def _is_ctrl_pressed():
-    return bool(ctypes.windll.user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
+if _platform.system() == "Windows":
+    VK_CONTROL = 0x11
+    VK_SHIFT   = 0x10
 
-def _is_shift_pressed():
-    return bool(ctypes.windll.user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
+    def _is_ctrl_pressed(flags: int = 0) -> bool:
+        return bool(ctypes.windll.user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
 
-# ── DPI awareness (must be called before any window creation) ──────────────────
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(1)   # PROCESS_SYSTEM_DPI_AWARE
-except (AttributeError, OSError):
+    def _is_shift_pressed(flags: int = 0) -> bool:
+        return bool(ctypes.windll.user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
+
+    # DPI awareness (Windows only)
     try:
-        ctypes.windll.user32.SetProcessDPIAware()
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except (AttributeError, OSError):
-        pass
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            pass
+else:
+    def _is_ctrl_pressed(flags: int = 0) -> bool:
+        return bool(flags & cv2.EVENT_FLAG_CTRLKEY)
+
+    def _is_shift_pressed(flags: int = 0) -> bool:
+        return bool(flags & cv2.EVENT_FLAG_SHIFTKEY)
 
 
 # ── Persistent time helpers ────────────────────────────────────────────────────
@@ -915,13 +924,13 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
 
     # ── Scroll zoom (Ctrl + wheel) ─────────────────────────────────────────
     if event == cv2.EVENT_MOUSEWHEEL:
-        if _is_ctrl_pressed():
+        if _is_ctrl_pressed(flags):
             delta = 1 if flags > 0 else -1
             _handle_zoom(state, x, y, delta)
         return
 
     # ── Ctrl+Shift + Middle-click: delete annotation ───────────────────────
-    if event == cv2.EVENT_MBUTTONDOWN and _is_ctrl_pressed() and _is_shift_pressed():
+    if event == cv2.EVENT_MBUTTONDOWN and _is_ctrl_pressed(flags) and _is_shift_pressed(flags):
         pw = state.panel_w
         rx = pw + state.gap
         if y < state.panel_h:
@@ -973,7 +982,7 @@ def on_mouse(event: int, x: int, y: int, flags: int, param):
         return
 
     # ── Ctrl + Left-click: toggle bbox visibility ───────────────────────────
-    if event == cv2.EVENT_LBUTTONDOWN and _is_ctrl_pressed() and y < state.panel_h:
+    if event == cv2.EVENT_LBUTTONDOWN and _is_ctrl_pressed(flags) and y < state.panel_h:
         pw = state.panel_w
         rx = pw + state.gap
         if x < pw:
