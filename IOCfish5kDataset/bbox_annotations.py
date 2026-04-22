@@ -104,7 +104,10 @@ Usage examples
 tmux new -s mysession
 conda activate geco_310
 CUDA_VISIBLE_DEVICES=1,2 python bbox_annotations.py --num_gpus 2 --method rgbd --in_dir ~/GECO2/IOCfish5kDataset/badly_annotated/auto_annotated_images --out_dir ~/GECO2/IOCfish5kDataset/better_annotated_v3
+Ctrl + b, then d (to detach and leave the process running in the background)
 tmux attach -t mysession
+cd /home/erik/GECO2/IOCfish5kDataset/ && zip -r better_annotated_v3.zip better_annotated_v3
+# locally: scp -r -P 30688 -i C:\\Users\\radov\\.ssh\\id_ed25519 erik@proxy.vicos.si:~/GECO2/better_annotated_v3.zip /home/erik/Diploma-GECO2-with-Depth-information/GECO2/IOCfish5kDataset/_data
 
 
 # 1. Default folders (point_annotations/ → auto_annotated_images/):
@@ -196,6 +199,10 @@ RGBD_SCORE_DOMINANCE = 1.5   # one modality dominates if its score is this times
 RGBD_DEPTH_COMPACT_W = 0.8   # prefer depth mask if it is smaller and at least this fraction of rgb score
 RGBD_CENTERING_GOOD  = 0.5   # point within half the bbox radius of centre counts as "well-centred"
 RGBD_CENTERING_DIFF  = 0.20  # one modality must beat the other's centring by this much to win
+RGBD_SIZE_DOMINANCE  = 2.0   # when both masks are well-centred, the one this much larger wins
+
+# Post-processing: enforce centrality of the annotation point in the final bbox.
+RECENTER_MAX_ASYMMETRY = 0.5  # shrink the long side of an axis when |l-r|/width > this
 
 # Dense-cluster and bbox-size-cap settings.
 DENSE_RADIUS_FACTOR = 1.5     # points within median_nn * this factor are "neighbors"
@@ -207,6 +214,7 @@ SWARM_OVERSIZE_THR  = 3.0     # bbox area > median_cluster_area * this = "oversi
 MULTIPOINT_SIZE_THR = 3.0     # multipoint bbox replaced only if side > this * typical side
 MULTIPOINT_MIN_PTS  = 3       # ... and only if it contains at least this many points
 MULTIPOINT_OWN_CENTRED = 0.4  # ... and only if its own point is NOT this well-centred
+MULTIPOINT_LARGE_OBJ_THR = 5.0  # own-centred exemption applies only above this * typical side
 
 # Duplicate-bbox detection settings.
 DUPLICATE_IOU_THR     = 0.70  # IoU above this means "same bbox" (SAM2 swarm failure)
@@ -348,14 +356,21 @@ def _fix_multipoint_bboxes(
     A bbox is considered "over-grouping" when it contains >=
     MULTIPOINT_MIN_PTS annotation points *and* is noticeably larger than the
     typical single-point bbox in the image (side > MULTIPOINT_SIZE_THR *
-    median single-point side).  Even then, a bbox whose *own* point is
-    well-centred (centring ratio <= MULTIPOINT_OWN_CENTRED) is left alone —
-    a well-centred own point is strong evidence that the bbox legitimately
-    belongs to a large object (e.g. a shark) that happens to overlap a few
-    smaller fish annotations.
+    median single-point side).
 
-    Each over-grouping bbox that still passes all the checks is replaced by
-    a square centred on its own point, sized by that point's nearest-
+    The well-centred own-point exemption (centring ratio <=
+    MULTIPOINT_OWN_CENTRED) only applies when the bbox is a *clear*
+    large-object outlier (side >= MULTIPOINT_LARGE_OBJ_THR * typical side).
+    In that regime a centred own-point is strong evidence of a legitimate
+    large object (shark, manta) that happens to overlap some smaller fish
+    annotations.  Below that threshold, a merely-moderately-oversized bbox
+    with a centred own-point is more likely a SAM2 swarm-grouping failure
+    (especially in dense-swarm images where many small fish occasionally
+    get lumped into a single mask whose centroid happens to land near one
+    of their annotation points), and is still collapsed.
+
+    Each over-grouping bbox that fails the exemption is replaced by a
+    square centred on its own point, sized by that point's nearest-
     neighbour distance (capped at the typical single-point side so
     replacements don't balloon).
     """
@@ -406,16 +421,22 @@ def _fix_multipoint_bboxes(
         bbox_side = (bb_arr[i, 2] + bb_arr[i, 3]) / 2.0
         if bbox_side <= ref_side * MULTIPOINT_SIZE_THR:
             continue  # near-typical size, likely genuine overlap — keep as-is
-        # Keep the bbox if its own annotation point is well-centred in it:
-        # that's strong evidence the bbox is a legitimate large-object
-        # detection and the contained extra points are just neighbouring
-        # fish that happen to lie on top of the big object.
+        # The "own point is well-centred → keep" exemption only fires when
+        # the bbox is a *clear* large-object outlier (>= MULTIPOINT_LARGE_OBJ_THR
+        # * ref_side).  A merely-oversized bbox (3–5× typical fish) whose own
+        # point is centred is more likely a SAM2 swarm-grouping failure than a
+        # legitimate large object — the grouped mask's centroid tends to land
+        # near one of the enclosed annotation points and would otherwise
+        # escape collapse.
         own_ratio = _bbox_centering(
             (int(bb_arr[i, 0]), int(bb_arr[i, 1]),
              int(bb_arr[i, 2]), int(bb_arr[i, 3])),
             int(points[i][0]), int(points[i][1]),
         )
-        if own_ratio <= MULTIPOINT_OWN_CENTRED:
+        if (
+            own_ratio <= MULTIPOINT_OWN_CENTRED
+            and bbox_side > ref_side * MULTIPOINT_LARGE_OBJ_THR
+        ):
             continue
         cx, cy = points[i]
         cx_c = int(np.clip(cx, 0, w - 1))
@@ -427,6 +448,67 @@ def _fix_multipoint_bboxes(
         bw = min(side, w - bx)
         bh = min(side, h - by)
         out[i] = (bx, by, bw, bh)
+    return out
+
+
+def _recenter_off_center_bboxes(
+    points: list[tuple[int, int]],
+    bboxes: list[tuple[int, int, int, int]],
+    h: int,
+    w: int,
+    threshold: float = RECENTER_MAX_ASYMMETRY,
+) -> list[tuple[int, int, int, int]]:
+    """Crop bboxes whose annotation point is significantly off-centre.
+
+    When SAM 2 over-segments (e.g. the mask extends beyond the target fish
+    into a neighbour), the annotation point ends up far from one edge and
+    close to the opposite edge.  For each axis, we compute the per-axis
+    asymmetry ``|l - r| / bbox_width`` (0 = centred, 1 = point at the edge).
+    When it exceeds *threshold*, the long side is cropped so the new half-
+    size equals the short side's distance to the point — mirroring the
+    short side across the point.  This trims the spurious extension that
+    swallowed a neighbour while preserving the axis where the bbox was
+    already centred.
+
+    Each axis is handled independently so a bbox that is centred on one
+    axis but not the other is only cropped on the bad axis.
+    """
+    out: list[tuple[int, int, int, int]] = []
+    for (cx, cy), (bx, by, bw, bh) in zip(points, bboxes):
+        if bw <= 0 or bh <= 0:
+            out.append((bx, by, bw, bh))
+            continue
+
+        cx_c = int(np.clip(cx, 0, w - 1))
+        cy_c = int(np.clip(cy, 0, h - 1))
+
+        new_bx, new_bw = bx, bw
+        new_by, new_bh = by, bh
+
+        left = cx_c - bx
+        right = bx + bw - cx_c
+        if left > 0 and right > 0:
+            dx_ratio = abs(left - right) / float(bw)
+            if dx_ratio > threshold:
+                half = max(1, min(left, right))
+                new_bx = cx_c - half
+                new_bw = 2 * half
+
+        top = cy_c - by
+        bottom = by + bh - cy_c
+        if top > 0 and bottom > 0:
+            dy_ratio = abs(top - bottom) / float(bh)
+            if dy_ratio > threshold:
+                half = max(1, min(top, bottom))
+                new_by = cy_c - half
+                new_bh = 2 * half
+
+        # Clamp to image bounds.
+        new_bx = max(0, new_bx)
+        new_by = max(0, new_by)
+        new_bw = max(1, min(new_bw, w - new_bx))
+        new_bh = max(1, min(new_bh, h - new_by))
+        out.append((new_bx, new_by, new_bw, new_bh))
     return out
 
 
@@ -1316,14 +1398,21 @@ def _fuse_single_point(
          on it, and is larger than the RGB mask, trust depth — it likely
          found a large object that the RGB hint cut off (e.g. a turtle
          swimming amongst small fish).
-      2. Centering — of the masks that contain the point, prefer the one
+      2. Size-when-both-centred — when both masks contain the point *and*
+         both are well-centred on it (ratio <= RGBD_CENTERING_GOOD), prefer
+         the substantially larger one (>= RGBD_SIZE_DOMINANCE× area).  This
+         rescues large, un-hinted objects (shark, manta) where one modality
+         only captured a fragment and the other captured the full body:
+         without this rule the fragment mask would win on centring alone
+         (a tiny bbox is trivially centred on its own point).
+      3. Centering — of the masks that contain the point, prefer the one
          whose bbox is better centred on the annotation point.  A
          RGBD_CENTERING_DIFF margin is required to unseat the other
          modality; if both are well-centred within the tolerance, RGB wins.
-      3. Intersection — if the two masks agree (IoU >= RGBD_IOU_AGREE_THR)
+      4. Intersection — if the two masks agree (IoU >= RGBD_IOU_AGREE_THR)
          and the intersection still contains the point, use the intersection
          for a tighter box.
-      4. Score dominance / depth compactness / higher-score fall-through
+      5. Score dominance / depth compactness / higher-score fall-through
          (as in previous versions).
     If only one mask is valid we use it directly.
     If neither is valid we fall back to a square box sized by fish scale.
@@ -1344,24 +1433,40 @@ def _fuse_single_point(
             return _mask_to_bbox_xywh(depth_mask, cx, cy, h, w, scale), depth_score
 
         if rgb_has_pt and depth_has_pt:
+            rgb_area = float(rgb_mask.sum())
+            depth_area = float(depth_mask.sum())
+
             # 1. Hint override: an un-hinted depth mask that is clearly
             # larger and reasonably centred on the point overrules a
             # hint-tightened RGB bbox.  This rescues large objects
             # (turtle, big fish) whose point happens to sit in a dense
             # cluster and would otherwise get a matchbox-sized bbox.
             if rgb_was_hinted:
-                rgb_area = float(rgb_mask.sum())
-                depth_area = float(depth_mask.sum())
                 if depth_area > rgb_area * 1.5 and depth_center <= RGBD_CENTERING_GOOD:
                     return _mask_to_bbox_xywh(depth_mask, cx, cy, h, w, scale), depth_score
 
-            # 2. Centering-first comparison.
+            # 2. Size-when-both-centred: pure centring is insufficient
+            # because any small mask is trivially centred on its own point.
+            # When both modalities are well-centred, the substantially
+            # larger one more likely reflects the true object extent
+            # (catches un-hinted large objects like sharks and mantas
+            # whose RGB-only mask may only cover a fragment of the body).
+            if (
+                rgb_center <= RGBD_CENTERING_GOOD
+                and depth_center <= RGBD_CENTERING_GOOD
+            ):
+                if depth_area > rgb_area * RGBD_SIZE_DOMINANCE:
+                    return _mask_to_bbox_xywh(depth_mask, cx, cy, h, w, scale), depth_score
+                if rgb_area > depth_area * RGBD_SIZE_DOMINANCE:
+                    return _mask_to_bbox_xywh(rgb_mask, cx, cy, h, w, scale), rgb_score
+
+            # 3. Centering-first comparison.
             if depth_center + RGBD_CENTERING_DIFF < rgb_center:
                 return _mask_to_bbox_xywh(depth_mask, cx, cy, h, w, scale), depth_score
             if rgb_center + RGBD_CENTERING_DIFF < depth_center:
                 return _mask_to_bbox_xywh(rgb_mask, cx, cy, h, w, scale), rgb_score
             if rgb_center <= RGBD_CENTERING_GOOD and depth_center <= RGBD_CENTERING_GOOD:
-                # Both well-centred within the tolerance — prefer RGB.
+                # Both well-centred within the tolerance and similar size — prefer RGB.
                 return _mask_to_bbox_xywh(rgb_mask, cx, cy, h, w, scale), rgb_score
 
         # 3. Intersection for agreeing masks.
@@ -1616,9 +1721,12 @@ def generate_bbox_xml(
 
     # Final fixups (apply to every method):
     #   1) replace bboxes that swallow multiple annotation points,
-    #   2) guarantee the annotation point lies inside its bbox.
+    #   2) crop off-centre bboxes so the point is roughly centred (this
+    #      removes spurious extensions into neighbouring fish),
+    #   3) guarantee the annotation point lies inside its bbox.
     h_img, w_img = img.shape[:2]
     bboxes = _fix_multipoint_bboxes(points, bboxes, h_img, w_img)
+    bboxes = _recenter_off_center_bboxes(points, bboxes, h_img, w_img)
     bboxes = _enforce_point_inside_bbox(points, bboxes, h_img, w_img)
 
     out_dir = xml_out_dir if xml_out_dir is not None else OUT_XML_DIR
