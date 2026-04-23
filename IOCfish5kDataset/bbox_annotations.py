@@ -20,7 +20,7 @@ RGBD method — step-by-step pipeline
    (nn_dist × DENSE_SCALE_SHRINK).  Isolated points keep the global
    fish-scale estimate (median NN distance × 0.7).
 
-2. **Dual SAM 2 inference (RGB + depth)**
+2. **Dual SAM 2 inference (RGB + depth) with per-point depth proxy**
    SAM 2 (facebook/sam2-hiera-base-plus) is run *twice* — once on the
    original RGB image and once on the colourised depth map — using single-
    point prompts.  For dense-cluster points the RGB prompt additionally
@@ -32,23 +32,32 @@ RGBD method — step-by-step pipeline
    fish) whose annotation point happens to sit inside a dense cluster of
    smaller neighbours.  Each run yields a per-point binary mask and a
    predicted-IoU confidence score.
+   A per-point **depth proxy** in [0, 1] (0 = far, 1 = close) is also
+   computed from the depth colormap's grayscale intensity, normalised by
+   per-image 5th/95th percentiles.  It drives the far-depth shrink rule
+   in fusion and the close-depth exemplar choice in the GECO2 swarm
+   refinement below.
 
-3. **Per-point mask fusion (centring-first)**
+3. **Per-point mask fusion (far-depth-aware, centring-first)**
    For every annotation point the RGB and depth masks are fused with the
    following precedence:
-     1. **Containment** — a mask whose bbox contains the point wins over
+     1. **Far-depth shrink** — if the point sits in a far-depth pixel
+        (depth proxy ≤ FAR_DEPTH_THR) and both masks contain the point,
+        prefer the smaller mask (its area ≤ 0.8 × the other's).  Far
+        objects are physically small; a big mask almost always leaked.
+     2. **Containment** — a mask whose bbox contains the point wins over
         one that doesn't.
-     2. **Hint override** — if RGB was box-hinted and the un-hinted depth
+     3. **Hint override** — if RGB was box-hinted and the un-hinted depth
         mask is noticeably larger *and* still reasonably centred on the
         point, depth wins (rescues large objects that RGB's hint cut off).
-     3. **Centring** — otherwise the mask on which the point is closer to
-        the bbox centre wins.  A minimum margin (RGBD_CENTERING_DIFF) is
-        required to unseat the other modality; if both are well centred,
-        RGB wins.
-     4. **Intersection** — if the two masks agree well (IoU ≥ 0.25) and
+     4. **Centring** — otherwise the mask on which the point is closer to
+        the bbox centre wins.  A minimum margin (RGBD_CENTERING_DIFF = 0.15)
+        is required to unseat the other modality; if both are well
+        centred, RGB wins.
+     5. **Intersection** — if the two masks agree well (IoU ≥ 0.25) and
         the intersection still contains the point, use the intersection
         for a tighter box.
-     5. **Score/compactness fall-through** — score dominance (≥ 1.5×),
+     6. **Score/compactness fall-through** — score dominance (≥ 1.5×),
         then "depth more compact at ≥ 0.8× RGB score", then the higher
         score outright (ties to RGB).
    If neither modality produces a usable mask (< 10 px) a square fallback
@@ -69,18 +78,46 @@ RGBD method — step-by-step pipeline
 
 5. **GECO2 swarm refinement** (optional, enabled by default)
    Dense clusters are identified again (same KD-tree connected-component
-   algorithm).  For each cluster that contains oversized SAM 2 bboxes
-   (area > median cluster area × 3):
-     a. Three exemplar bboxes closest to the cluster's median area are
-        picked.  If any exemplar exceeds 1/8 of the image dimension the
-        cluster is skipped (bad exemplars would mislead GECO2).
+   algorithm).  For each cluster that contains oversized bboxes:
+     a. Exemplar selection depends on the cluster's mean depth proxy:
+        * **Close-depth clusters** (mean depth proxy > CLOSE_DEPTH_THR):
+          the three points with the *largest* depth proxy (i.e., closest
+          to the camera) are used as exemplars.  Their bboxes are
+          typically the tightest because the depth colormap separates
+          them best from background, and feeding these to GECO2 gives a
+          consistent small size reference for the whole cluster.  The
+          "oversized" threshold is also tightened: bboxes larger than
+          CLOSE_CLUSTER_OVERSIZE_THR × the cluster's *smallest* bbox
+          area are replaced (the cluster median is skewed upward by
+          depth-mask merges).
+        * Otherwise, three exemplars closest to the cluster's median
+          area are picked; oversize ≡ area > median × SWARM_OVERSIZE_THR.
+        If any exemplar exceeds 1/8 of the image dimension the cluster is
+        skipped (bad exemplars would mislead GECO2).
      b. GECO2 is run on the full image with those exemplars; the model
         predicts detection boxes and confidence scores.
      c. Each predicted box is matched to the nearest annotation point
         (preferring boxes that contain the point).
-     d. Oversized SAM 2 bboxes are replaced by the GECO2 prediction;
+     d. Oversized bboxes are replaced by the GECO2 prediction;
         non-oversized bboxes are replaced only if GECO2 found a
-        meaningfully tighter box (area < 80 % of SAM 2 area).
+        meaningfully tighter box (area < 80 % of current area).
+
+6. **Final per-image fixups** (every method)
+   Run in order after the per-method pipeline finishes:
+     * **Multipoint collapse** — bboxes that swallow ≥ 3 annotation
+       points and are noticeably larger than a typical single-point box
+       are replaced with a small square centred on their own point
+       (see :func:`_fix_multipoint_bboxes`).
+     * **Thin-bbox fix** — bboxes whose long/short side ratio ≥
+       THIN_BBOX_ASPECT_THR are replaced with a square whose side equals
+       the original short edge (SAM 2 occasionally produces thin
+       horizontal/vertical stripes that satisfy neither axis of the
+       centrality check).
+     * **Off-centre crop** — per-axis asymmetry above
+       RECENTER_MAX_ASYMMETRY = 0.35 triggers cropping the long side so
+       the point becomes centred (stricter than earlier versions).
+     * **Containment guarantee** — every bbox is expanded if needed so
+       its annotation point is strictly inside.
 
 Default folder structure (inside IOCfish5kDataset/):
 
@@ -198,11 +235,19 @@ RGBD_IOU_AGREE_THR   = 0.25  # masks with IoU above this are considered agreeing
 RGBD_SCORE_DOMINANCE = 1.5   # one modality dominates if its score is this times higher
 RGBD_DEPTH_COMPACT_W = 0.8   # prefer depth mask if it is smaller and at least this fraction of rgb score
 RGBD_CENTERING_GOOD  = 0.5   # point within half the bbox radius of centre counts as "well-centred"
-RGBD_CENTERING_DIFF  = 0.20  # one modality must beat the other's centring by this much to win
+RGBD_CENTERING_DIFF  = 0.15  # one modality must beat the other's centring by this much to win
 RGBD_SIZE_DOMINANCE  = 2.0   # when both masks are well-centred, the one this much larger wins
+RGBD_FAR_SMALLER_RATIO = 0.8 # far-depth point: prefer the smaller modality if its area <= this * the other's
+RGBD_HINT_OVERRIDE_CENTER = 0.75  # hint override allows a looser depth centring (dot on a fish head has ratio ~0.7)
 
 # Post-processing: enforce centrality of the annotation point in the final bbox.
-RECENTER_MAX_ASYMMETRY = 0.5  # shrink the long side of an axis when |l-r|/width > this
+RECENTER_MAX_ASYMMETRY = 0.35 # shrink the long side of an axis when |l-r|/width > this
+THIN_BBOX_ASPECT_THR   = 3.0  # bbox with long/short side ratio above this is replaced by a square
+
+# Depth-colormap thresholds (per-point normalised depth proxy, 0=far, 1=close).
+FAR_DEPTH_THR    = 0.30       # below this the point is "far" (dark blue/violet depth pixel)
+CLOSE_DEPTH_THR  = 0.55       # cluster mean above this counts as a "close" cluster
+CLOSE_CLUSTER_OVERSIZE_THR = 1.8  # in close-depth clusters, bboxes > this × smallest-cluster-area are oversize
 
 # Dense-cluster and bbox-size-cap settings.
 DENSE_RADIUS_FACTOR = 1.5     # points within median_nn * this factor are "neighbors"
@@ -343,6 +388,74 @@ def _iou_matrix_xywh(bboxes: np.ndarray) -> np.ndarray:
 
     union = areas[:, None] + areas[None, :] - inter
     return np.where(union > 0.0, inter / union, 0.0)
+
+
+def _depth_at_points(
+    depth_bgr: np.ndarray,
+    points: list[tuple[int, int]],
+) -> np.ndarray:
+    """Return per-point normalised depth proxy in [0, 1] from a depth colormap.
+
+    0 ≈ darkest pixels (typically the farthest region in viridis/inferno/
+    magma/turbo colormaps), 1 ≈ brightest (typically the nearest).  A 5×5
+    patch median is used for robustness against JPEG artefacts, and
+    normalisation uses 5th/95th image percentiles so the scale is relative
+    to this frame's actual depth range.
+
+    Assumes a perceptually-uniform colormap where pixel brightness is
+    approximately monotonic with depth.  This holds for the colormaps used
+    in our depth pipeline; turbo would need a hue-based alternative.
+    """
+    h, w = depth_bgr.shape[:2]
+    gray = cv2.cvtColor(depth_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    lo, hi = np.percentile(gray, [5, 95])
+    if hi - lo < 1e-6:
+        return np.full(len(points), 0.5, dtype=np.float32)
+    normalised = np.clip((gray - lo) / (hi - lo), 0.0, 1.0)
+    vals = np.empty(len(points), dtype=np.float32)
+    for i, (cx, cy) in enumerate(points):
+        cx_c = int(np.clip(cx, 0, w - 1))
+        cy_c = int(np.clip(cy, 0, h - 1))
+        y0, y1 = max(0, cy_c - 2), min(h, cy_c + 3)
+        x0, x1 = max(0, cx_c - 2), min(w, cx_c + 3)
+        patch = normalised[y0:y1, x0:x1]
+        vals[i] = float(np.median(patch)) if patch.size > 0 else 0.5
+    return vals
+
+
+def _fix_thin_bboxes(
+    points: list[tuple[int, int]],
+    bboxes: list[tuple[int, int, int, int]],
+    h: int,
+    w: int,
+) -> list[tuple[int, int, int, int]]:
+    """Replace extremely elongated bboxes with a square centred on the point.
+
+    SAM 2 sometimes returns masks consisting of a thin horizontal or vertical
+    stripe (e.g., a waterline, a thin shadow band, or a seam in the depth
+    colormap) whose bbox has an aspect ratio ≥ THIN_BBOX_ASPECT_THR.  These
+    rarely reflect a real fish and almost always fail the per-axis centring
+    check anyway.  Replace the bbox with a square whose side equals the
+    original short edge — the fix is never larger than the original.
+    """
+    out = list(bboxes)
+    for i, ((cx, cy), (bx, by, bw, bh)) in enumerate(zip(points, bboxes)):
+        if bw <= 0 or bh <= 0:
+            continue
+        long_side = max(bw, bh)
+        short_side = max(1, min(bw, bh))
+        if long_side / short_side < THIN_BBOX_ASPECT_THR:
+            continue
+        cx_c = int(np.clip(cx, 0, w - 1))
+        cy_c = int(np.clip(cy, 0, h - 1))
+        side = short_side
+        half = side // 2
+        nbx = max(0, cx_c - half)
+        nby = max(0, cy_c - half)
+        nbw = min(side, w - nbx)
+        nbh = min(side, h - nby)
+        out[i] = (nbx, nby, nbw, nbh)
+    return out
 
 
 def _fix_multipoint_bboxes(
@@ -863,6 +976,27 @@ def _pick_median_exemplars(
     return chosen
 
 
+def _pick_closest_depth_exemplars(
+    indices: list[int],
+    bboxes: list[tuple[int, int, int, int]],
+    depth_at_points: np.ndarray,
+    n: int = GECO2_NUM_OBJECTS,
+) -> list[tuple[int, int, int, int]]:
+    """Pick *n* exemplar bboxes from the points with the largest depth proxy.
+
+    In a close-depth cluster the annotation point with the largest depth
+    proxy typically corresponds to the fish closest to the camera, whose
+    bbox is usually the tightest (least likely to have merged with
+    neighbours in the depth map).  Using these as exemplars gives GECO2 a
+    small, consistent size reference for the whole cluster.
+    """
+    ordered = sorted(indices, key=lambda i: -float(depth_at_points[i]))
+    chosen = [bboxes[i] for i in ordered[:n]]
+    while len(chosen) < n:
+        chosen.append(chosen[-1])
+    return chosen
+
+
 def _refine_swarm_with_geco2(
     img_bgr: np.ndarray,
     points: list[tuple[int, int]],
@@ -870,18 +1004,26 @@ def _refine_swarm_with_geco2(
     scores: list[float],
     geco2_model,
     device: str = "cuda",
+    depth_at_points: np.ndarray | None = None,
 ) -> tuple[list[tuple[int, int, int, int]], list[float]]:
     """Refine bboxes in dense swarms using GECO2.
 
     For each detected dense cluster:
-      1. Pick 3 median-area bboxes from the cluster as exemplars.
+      1. Pick 3 exemplar bboxes from the cluster:
+         * for "close-depth" clusters (mean depth proxy > CLOSE_DEPTH_THR),
+           pick the 3 points with the *largest* depth proxy — their bboxes
+           tend to be the tightest because the depth map separates them
+           best from background;
+         * otherwise, pick the 3 bboxes whose area is closest to the
+           cluster median (the historical behaviour).
       2. Run GECO2 on the full image with those exemplars.
-      3. For each cluster point whose SAM2 bbox is oversized relative to
-         the cluster median, replace it with the GECO2 bbox if GECO2
-         produced a valid (non-zero) detection.
+      3. For each cluster point whose SAM2/RGBD bbox is oversized relative
+         to the reference (cluster median, or the chosen exemplar's area
+         for close-depth clusters), replace it with the GECO2 bbox if
+         GECO2 produced a valid (non-zero) detection.
 
-    Points outside any dense cluster, or whose SAM2 bbox is already
-    reasonable, are left untouched.
+    Points outside any dense cluster, or whose bbox is already reasonable,
+    are left untouched.
     """
     if geco2_model is None or not points:
         return bboxes, scores
@@ -895,20 +1037,45 @@ def _refine_swarm_with_geco2(
     scores = list(scores)
 
     for cluster_idx in clusters:
-        # Compute median bbox area in this cluster.
+        # Decide whether this cluster is close-depth.
+        is_close_cluster = False
+        if depth_at_points is not None and len(cluster_idx) > 0:
+            mean_depth = float(np.mean(depth_at_points[cluster_idx]))
+            is_close_cluster = mean_depth > CLOSE_DEPTH_THR
+
+        # Compute cluster bbox areas and the reference for "oversized".
         areas = [bboxes[i][2] * bboxes[i][3] for i in cluster_idx]
         median_area = float(np.median(areas))
+
+        if is_close_cluster:
+            # In close-depth clusters the median is skewed upward by the
+            # over-merged depth-mask bboxes.  Anchor the oversize test on
+            # the *smallest* bbox in the cluster (likely the best-bounded
+            # fish closest to the camera) with a tighter multiplier, so
+            # most of the merged ones get flagged.
+            smallest_area = float(min(areas)) if areas else median_area
+            oversize_ref = max(smallest_area, 1.0)
+            oversize_thr = CLOSE_CLUSTER_OVERSIZE_THR
+        else:
+            oversize_ref = max(median_area, 1.0)
+            oversize_thr = SWARM_OVERSIZE_THR
 
         # Identify cluster points with oversized bboxes.
         oversized = [
             i for i in cluster_idx
-            if bboxes[i][2] * bboxes[i][3] > median_area * SWARM_OVERSIZE_THR
+            if bboxes[i][2] * bboxes[i][3] > oversize_ref * oversize_thr
         ]
         if not oversized:
             continue  # all bboxes in this cluster are reasonable
 
-        # Pick 3 median exemplars from the cluster.
-        exemplars = _pick_median_exemplars(cluster_idx, bboxes)
+        # Pick exemplars.  Close-depth clusters → closest-depth points;
+        # otherwise → cluster-median bboxes.
+        if is_close_cluster and depth_at_points is not None:
+            exemplars = _pick_closest_depth_exemplars(
+                cluster_idx, bboxes, depth_at_points,
+            )
+        else:
+            exemplars = _pick_median_exemplars(cluster_idx, bboxes)
 
         # Skip GECO2 if exemplars are too large (> 1/8 of image dim).
         max_ex_w = w * GECO2_MAX_EXEMPLAR_FRAC
@@ -1385,11 +1552,23 @@ def _fuse_single_point(
     w: int,
     scale: int,
     rgb_was_hinted: bool = False,
+    point_depth: float = 1.0,
 ) -> tuple[tuple[int, int, int, int], float]:
     """
     Fuse the RGB and depth SAM 2 masks for one point into a single bbox.
 
+    ``point_depth`` is the per-point normalised depth proxy in [0, 1]
+    (0 = far, 1 = close).  Points at far depth (≤ FAR_DEPTH_THR) trigger
+    an early rule that prefers the *smaller* of the two masks — the
+    intuition is that far objects are physically small in the image, so if
+    one modality still produced a big mask it almost certainly leaked into
+    the background.
+
     Precedence rules (highest first):
+      -1. Far-depth shrink — if the point sits in a far-depth pixel
+         (``point_depth`` ≤ FAR_DEPTH_THR) and both masks contain the
+         point, prefer the mask whose area is ≤ RGBD_FAR_SMALLER_RATIO ×
+         the other's.
       0. Containment — a mask whose bounding rect contains the annotation
          point beats one whose bounding rect does not.
       1. Hint override — when the RGB run was given a tight box-hint (dense
@@ -1426,6 +1605,22 @@ def _fuse_single_point(
         rgb_has_pt = rgb_center < 1.0
         depth_has_pt = depth_center < 1.0
 
+        # -1. Far-depth shrink: objects at far depth should be small in the
+        # image; the bigger proposal is almost always wrong (leak into the
+        # background or into a nearer neighbour).  Trigger only when both
+        # masks contain the point, so we don't silently drop containment.
+        if (
+            point_depth <= FAR_DEPTH_THR
+            and rgb_has_pt
+            and depth_has_pt
+        ):
+            rgb_area = float(rgb_mask.sum())
+            depth_area = float(depth_mask.sum())
+            if depth_area <= rgb_area * RGBD_FAR_SMALLER_RATIO:
+                return _mask_to_bbox_xywh(depth_mask, cx, cy, h, w, scale), depth_score
+            if rgb_area <= depth_area * RGBD_FAR_SMALLER_RATIO:
+                return _mask_to_bbox_xywh(rgb_mask, cx, cy, h, w, scale), rgb_score
+
         # 0. Containment wins outright when only one modality contains the point.
         if rgb_has_pt and not depth_has_pt:
             return _mask_to_bbox_xywh(rgb_mask, cx, cy, h, w, scale), rgb_score
@@ -1442,7 +1637,15 @@ def _fuse_single_point(
             # (turtle, big fish) whose point happens to sit in a dense
             # cluster and would otherwise get a matchbox-sized bbox.
             if rgb_was_hinted:
-                if depth_area > rgb_area * 1.5 and depth_center <= RGBD_CENTERING_GOOD:
+                # Looser centring tolerance here (RGBD_HINT_OVERRIDE_CENTER vs
+                # RGBD_CENTERING_GOOD): when the annotation dot sits on a fish
+                # head, the full-body depth mask's centroid is below the head,
+                # giving a centring ratio around 0.7 — still a perfectly
+                # legitimate mask, just not "well-centred" in the strict sense.
+                if (
+                    depth_area > rgb_area * 1.5
+                    and depth_center <= RGBD_HINT_OVERRIDE_CENTER
+                ):
                     return _mask_to_bbox_xywh(depth_mask, cx, cy, h, w, scale), depth_score
 
             # 2. Size-when-both-centred: pure centring is insufficient
@@ -1548,6 +1751,11 @@ def compute_bboxes_rgbd(
     # defer to the un-hinted depth mask for genuinely large objects.
     rgb_hinted = [ls < global_scale for ls in local_scales]
 
+    # Per-point depth proxy in [0, 1] (0 = far, 1 = close).  Drives the
+    # far-depth shrink rule in fusion and the close-depth exemplar choice
+    # in the GECO2 swarm refinement below.
+    point_depth = _depth_at_points(depth_bgr, points)
+
     rgb_bboxes, rgb_scores, rgb_masks = _sam2_predict_per_point(
         img_bgr, points, predictor,
         local_scales=local_scales, use_box_hint=True,
@@ -1575,6 +1783,7 @@ def compute_bboxes_rgbd(
             depth_masks[i], depth_scores[i],
             cx_c, cy_c, h, w, min(scale, local_scales[i]),
             rgb_was_hinted=rgb_hinted[i],
+            point_depth=float(point_depth[i]),
         )
         fused_bboxes.append(bbox)
         fused_scores.append(conf)
@@ -1585,6 +1794,7 @@ def compute_bboxes_rgbd(
     )
     fused_bboxes, fused_scores = _refine_swarm_with_geco2(
         img_bgr, points, fused_bboxes, fused_scores, geco2_model, device,
+        depth_at_points=point_depth,
     )
     return fused_bboxes, fused_scores
 
@@ -1721,11 +1931,15 @@ def generate_bbox_xml(
 
     # Final fixups (apply to every method):
     #   1) replace bboxes that swallow multiple annotation points,
-    #   2) crop off-centre bboxes so the point is roughly centred (this
+    #   2) replace extremely elongated bboxes with squares centred on the
+    #      point (SAM 2 sometimes returns thin horizontal/vertical stripes
+    #      whose bounding rect is useless as a fish box),
+    #   3) crop off-centre bboxes so the point is roughly centred (this
     #      removes spurious extensions into neighbouring fish),
-    #   3) guarantee the annotation point lies inside its bbox.
+    #   4) guarantee the annotation point lies inside its bbox.
     h_img, w_img = img.shape[:2]
     bboxes = _fix_multipoint_bboxes(points, bboxes, h_img, w_img)
+    bboxes = _fix_thin_bboxes(points, bboxes, h_img, w_img)
     bboxes = _recenter_off_center_bboxes(points, bboxes, h_img, w_img)
     bboxes = _enforce_point_inside_bbox(points, bboxes, h_img, w_img)
 
